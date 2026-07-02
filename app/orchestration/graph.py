@@ -11,7 +11,7 @@ Per turn (single node):
   * otherwise          -> RAG: if the KB covers it, stream a grounded answer;
                           if not, ask for MSNV/email to forward to the administrator
 
-State is checkpointed per session (thread_id = session_id) so `greeted` and the
+State is checkpointed per session (thread_id = channel_id) so `greeted` and the
 "awaiting MSNV" state survive between requests.
 """
 from __future__ import annotations
@@ -39,10 +39,11 @@ _SOCIAL = {
 
 
 def _serialize(emission: Emission) -> dict:
-    data: dict = {"kind": emission.kind.value, "text": emission.text}
+    data: dict = {"kind": emission.kind.value, "text": emission.text, "identify": emission.identify}
     if emission.kind == EmissionKind.RAG_ANSWER:
         data["query"] = emission.query
         data["context"] = [doc.as_text() for doc in emission.context]
+        data["doc_ids"] = [doc.doc_id for doc in emission.context]
     return data
 
 
@@ -53,7 +54,9 @@ def _is_smalltalk(message: str) -> bool:
 
 class ConversationState(TypedDict, total=False):
     user_input: str
-    session_id: str
+    channel_id: str
+    agent_id: str
+    platform: str
     history: list              # prior turns (from client) used for query rewrite
     greeted: bool
     awaiting_admin: bool       # we asked for MSNV/email to forward to admin
@@ -90,14 +93,14 @@ def build_conversation_graph(
         if state.get("awaiting_admin"):
             if notify_action is not None:
                 action_executor.execute(
-                    notify_action, state.get("session_id", ""),
+                    notify_action, state.get("channel_id", ""),
                     {"msnv_email": message.strip(), "unanswered": state.get("unanswered", "")},
                 )
             return {
                 "awaiting_admin": False, "unanswered": "",
                 "emissions": [
-                    {"kind": EmissionKind.TEXT.value, "text": forwarded_text},
-                    {"kind": EmissionKind.HANDOFF.value, "text": ""},
+                    {"kind": EmissionKind.TEXT.value, "text": forwarded_text, "identify": 1},
+                    {"kind": EmissionKind.HANDOFF.value, "text": "", "identify": 1},
                 ],
             }
 

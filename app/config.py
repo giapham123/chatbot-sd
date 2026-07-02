@@ -28,6 +28,15 @@ class Settings:
     qdrant_collection: str    # collection populated by scripts/embed_to_qdrant.py
     data_dir: Path
     history_turns: int        # how many prior messages (from the client) to feed the LLM
+    # Kafka
+    kafka_enabled: bool
+    kafka_host: str
+    kafka_input_topic: str
+    kafka_output_topic: str
+    kafka_group_id: str
+    # WebSocket (SocketCluster)
+    ws_enabled: bool
+    ws_url: str
 
     @staticmethod
     def load() -> "Settings":
@@ -45,4 +54,11 @@ class Settings:
             qdrant_collection=os.getenv("QDRANT_COLLECTION", "chatbot_sd_kb"),
             data_dir=data_dir,
             history_turns=int(os.getenv("HISTORY_TURNS", "6")),
+            kafka_enabled=os.getenv("KAFKA_ENABLED", "false").lower() == "true",
+            kafka_host=os.getenv("KAFKA_HOST", "localhost:9092"),
+            kafka_input_topic=os.getenv("KAFKA_INPUT_TOPIC", "ai-agent-chat"),
+            kafka_output_topic=os.getenv("KAFKA_OUTPUT_TOPIC", "bot-agent-service"),
+            kafka_group_id=os.getenv("KAFKA_GROUP_ID", "ai-agent-consumer"),
+            ws_enabled=os.getenv("WS_ENABLED", "false").lower() == "true",
+            ws_url=os.getenv("WS_URL", "ws://localhost:8001/socketcluster/"),
         )

@@ -5,7 +5,8 @@ Everything above this file depends only on interfaces. Change a backend (OpenAI
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Optional
 
 from langgraph.checkpoint.memory import MemorySaver
 from openai import AsyncOpenAI
@@ -13,7 +14,10 @@ from qdrant_client import AsyncQdrantClient
 
 from .services.actions import LoggingActionExecutor
 from .config import Settings
+from .kafka.consumer import KafkaConsumerService
+from .kafka.producer import KafkaProducerService
 from .orchestration.conversation import ConversationService
+from .ws.ws_service import WebsocketClient
 from .orchestration.graph import build_conversation_graph
 from .services.llm import OpenAIEmbeddingClient, OpenAILLMClient
 from .services.rag import DefaultRagService
@@ -24,7 +28,10 @@ from .services.vector_store import QdrantVectorStore
 @dataclass
 class Container:
     conversation: ConversationService
-    _conns: list  # open async clients to close on shutdown
+    kafka_consumer: Optional[KafkaConsumerService]
+    kafka_producer: Optional[KafkaProducerService]
+    ws_client: Optional[WebsocketClient]
+    _conns: list = field(default_factory=list)
 
     async def close(self) -> None:
         for conn in self._conns:
@@ -74,4 +81,25 @@ async def build_container(settings: Settings) -> Container:
         checkpointer=checkpointer,
     )
     conversation = ConversationService(graph, rag, settings.history_turns)
-    return Container(conversation=conversation, _conns=[qdrant_client])
+
+    kafka_consumer: Optional[KafkaConsumerService] = None
+    kafka_producer: Optional[KafkaProducerService] = None
+    if settings.kafka_enabled:
+        kafka_consumer = KafkaConsumerService(
+            host=settings.kafka_host,
+            group_id=settings.kafka_group_id,
+            topics=[settings.kafka_input_topic],
+        )
+        kafka_producer = KafkaProducerService(host=settings.kafka_host)
+
+    ws_client: Optional[WebsocketClient] = None
+    if settings.ws_enabled:
+        ws_client = WebsocketClient(settings.ws_url)
+
+    return Container(
+        conversation=conversation,
+        kafka_consumer=kafka_consumer,
+        kafka_producer=kafka_producer,
+        ws_client=ws_client,
+        _conns=[qdrant_client],
+    )

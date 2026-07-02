@@ -58,3 +58,5 @@ class Emission:
     # for RAG_ANSWER:
     query: str = ""
     context: list[KBDoc] = field(default_factory=list)
+    doc_ids: list[str] = field(default_factory=list)
+    identify: int = 2  # 1=identified (MSNV received), 2=not yet

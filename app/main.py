@@ -1,15 +1,25 @@
 """FastAPI app — SSE streaming endpoint for the SD chatbot.
 
-    POST /chat   { "session_id": "...", "message": "..." }  -> text/event-stream
+    POST /chat  (ChatSD schema)  ->  text/event-stream
 
 SSE frame format:  event: <type>\n data: <json>\n\n
-Event types: message | token | message_end | handoff | end | error | done
+Event types:
+  message      — scripted text ({"text": "..."})
+  token        — streaming token ({"text": "..."})
+  message_end  — signals end of token stream ({})
+  handoff      — transferred to human SD ({"text": ""})
+  end          — conversation ended ({"text": ""})
+  output       — full OutputChatSD JSON (channel_id, answer, similarity, ...)
+  error        — exception ({"text": "..."})
+  done         — stream complete ({})
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import uuid
 from contextlib import asynccontextmanager
-from typing import AsyncIterator
+from typing import AsyncIterator, Literal, Optional
 
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, StreamingResponse
@@ -17,6 +27,7 @@ from pydantic import BaseModel
 
 from .config import Settings
 from .container import Container, build_container
+from .kafka.router import consume_loop
 from .orchestration.conversation import StreamEvent
 
 _container: Container | None = None
@@ -25,42 +36,114 @@ _container: Container | None = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _container
-    _container = await build_container(Settings.load())
+    settings = Settings.load()
+    _container = await build_container(settings)
+
+    if _container.ws_client:
+        await _container.ws_client.connect()
+
+    kafka_task: asyncio.Task | None = None
+    if _container.kafka_consumer and _container.kafka_producer:
+        kafka_task = asyncio.create_task(
+            consume_loop(
+                _container.kafka_consumer,
+                _container.kafka_producer,
+                _container.conversation,
+                settings.kafka_input_topic,
+                settings.kafka_output_topic,
+                ws_client=_container.ws_client,
+            ),
+            name="kafka-consume-loop",
+        )
+
     yield
+
+    if kafka_task is not None:
+        kafka_task.cancel()
+        await asyncio.gather(kafka_task, return_exceptions=True)
+    if _container.ws_client:
+        await _container.ws_client.disconnect()
     await _container.close()
 
 
 app = FastAPI(title="Chatbot SD", lifespan=lifespan)
 
 
-class HistoryTurn(BaseModel):
-    role: str   # "user" | "bot"
-    text: str
+# ---------------------------------------------------------------------------
+# Request / Response schemas  (mirrors ai-agent ChatSD / OutputChatSD)
+# ---------------------------------------------------------------------------
+
+class UserInfo(BaseModel):
+    msnv: Optional[str] = None
+    email: Optional[str] = None
+    name: Optional[str] = None
 
 
-class ChatRequest(BaseModel):
-    session_id: str
-    message: str
-    history: list[HistoryTurn] = []  # prior turns from the client's localStorage
+class ChatSDRequest(BaseModel):
+    mode: Literal["NORMAL", "ADVANCE"] = "NORMAL"
+    first_session: Optional[bool] = None
+    channel_id: Optional[str] = None
+    agent_id: Optional[str] = None
+    question: Optional[str] = None
+    user: Optional[UserInfo] = None
+    platform: Optional[Literal["WEB", "TEST", "ZALO", "GROUPWARE"]] = "WEB"
+    chat_history: Optional[list[dict]] = None   # LangChain format: [{type, content}]
+    tool_messages: Optional[list[dict]] = None
+    recursion_count: Optional[int] = 0
+    last_tool_name: Optional[str] = ""
+    conversation_status: Literal[0, 1, 2, 3, 4] = 0
+    error: Optional[dict] = None
+    image_url: Optional[list[str]] = None
 
+
+# ---------------------------------------------------------------------------
+# SSE helpers
+# ---------------------------------------------------------------------------
 
 def _sse(event: StreamEvent) -> str:
+    if event.event == "output":
+        # data is already a JSON string (full OutputChatSD payload)
+        return f"event: {event.event}\ndata: {event.data}\n\n"
     return f"event: {event.event}\ndata: {json.dumps({'text': event.data}, ensure_ascii=False)}\n\n"
 
 
+def _lc_history_to_tuples(chat_history: list[dict] | None) -> list[tuple[str, str]]:
+    """Convert LangChain message list to (role, text) tuples the graph expects."""
+    result: list[tuple[str, str]] = []
+    for msg in (chat_history or []):
+        t = msg.get("type", "")
+        content = msg.get("content", "")
+        if t == "human":
+            result.append(("user", content))
+        elif t in ("ai", "assistant"):
+            result.append(("bot", content))
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Endpoint
+# ---------------------------------------------------------------------------
+
 @app.post("/chat")
-async def chat(req: ChatRequest) -> StreamingResponse:
+async def chat(req: ChatSDRequest) -> StreamingResponse:
     assert _container is not None
 
-    history = [(t.role, t.text) for t in req.history]
+    history = _lc_history_to_tuples(req.chat_history)
+    channel_id = req.channel_id or str(uuid.uuid4())
 
     async def event_stream() -> AsyncIterator[str]:
         try:
             async for event in _container.conversation.stream(
-                req.session_id, req.message, history
+                channel_id,
+                req.question or "",
+                history,
+                agent_id=req.agent_id,
+                platform=req.platform or "WEB",
+                conversation_status=req.conversation_status,
+                error=req.error,
             ):
                 yield _sse(event)
-        except Exception as exc:  # surface errors to the client, keep server alive
+        except Exception as exc:
             yield _sse(StreamEvent("error", str(exc)))
         finally:
             yield "event: done\ndata: {}\n\n"
@@ -99,8 +182,8 @@ _DEMO_HTML = """<!doctype html>
 // Chat history lives in the browser (localStorage) — no server-side DB.
 const KEY = 'chatbot_sd';
 let store = JSON.parse(localStorage.getItem(KEY) || 'null')
-        || { sid: 'sess-' + Math.random().toString(36).slice(2), msgs: [] };
-const sid = store.sid;
+        || { channel_id: 'ch-' + Math.random().toString(36).slice(2), msgs: [] };
+const channel_id = store.channel_id;
 const log = document.getElementById('log');
 let busy = false;
 function save(){ localStorage.setItem(KEY, JSON.stringify(store)); }
@@ -110,16 +193,17 @@ function line(cls, t){const d=document.createElement('div');d.className=cls;d.te
 for(const m of store.msgs){ line(m.role==='user'?'u':'b', (m.role==='user'?'Bạn: ':'Bot: ')+m.text); }
 
 async function send(){
-  if(busy)return;                       // guard against double-submit
+  if(busy)return;
   const inp=document.getElementById('msg');const text=inp.value.trim();if(!text)return;inp.value='';
   busy=true;
-  // History = prior turns (before this message), sent to the server for context.
-  const history=store.msgs.filter(m=>m.role==='user'||m.role==='bot');
+  // Build chat_history in LangChain format from stored messages.
+  const chat_history=store.msgs.map(m=>({type:m.role==='user'?'human':'ai',content:m.text}));
+  const conversation_status=store.msgs.length===0?0:1;
   line('u','Bạn: '+text);
   const botMsgs=[];let cur=null;let curText='';
   try{
   const res=await fetch('/chat',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({session_id:sid,message:text,history})});
+    body:JSON.stringify({channel_id,question:text,chat_history,platform:'WEB',conversation_status})});
   const reader=res.body.getReader();const dec=new TextDecoder();let buf='';
   while(true){const {value,done}=await reader.read();if(done)break;buf+=dec.decode(value,{stream:true});
     let parts=buf.split('\\n\\n');buf=parts.pop();
@@ -132,10 +216,10 @@ async function send(){
       else if(ev==='handoff'){line('sys','→ Đã chuyển cho nhân viên hỗ trợ (SD).');}
       else if(ev==='end'){line('sys','— Kết thúc cuộc trò chuyện —');}
       else if(ev==='error'){line('sys','Lỗi: '+data.text);}
+      // 'output' event carries full OutputChatSD JSON — available for callers.
     }
   }
   }finally{
-    // Persist this turn to localStorage.
     store.msgs.push({role:'user',text});
     for(const b of botMsgs) store.msgs.push({role:'bot',text:b});
     save();
@@ -163,8 +247,10 @@ def main() -> None:
         level=logging.DEBUG if debug else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    # Silence very chatty third-party debug logs (OpenAI request dumps, HTTP internals).
-    for noisy in ("openai", "httpx", "httpcore", "asyncio", "urllib3"):
+    for noisy in (
+        "openai", "httpx", "httpcore", "asyncio", "urllib3",
+        "aiokafka", "websockets",
+    ):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
     port = int(os.getenv("PORT", "8000"))

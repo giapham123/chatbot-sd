@@ -5,3 +5,4 @@ uvicorn[standard]>=0.29.0
 python-dotenv>=1.0.0
 pydantic>=2.6.0
 qdrant-client>=1.7.0
+aiokafka>=0.11.0

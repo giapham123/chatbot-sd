@@ -14,6 +14,7 @@ import logging
 import re
 from typing import AsyncIterator, Optional
 
+from openai import APIConnectionError, APITimeoutError
 from ..domain.interfaces import EmbeddingClient, KnowledgeRepository, LLMClient, VectorStore
 from ..domain.models import Emission, EmissionKind, KBDoc
 
@@ -104,6 +105,8 @@ class DefaultRagService:
             if rewritten:
                 logger.info("Query rewrite: %r -> %r", query, rewritten)
                 return rewritten
+        except (APIConnectionError, APITimeoutError) as exc:
+            logger.error("Query rewrite failed: cannot connect to OpenAI (%s); using original query", exc, exc_info=True)
         except Exception as exc:  # never let rewrite break the flow
             logger.warning("Query rewrite failed (%s); using original query", exc)
         return query
@@ -133,6 +136,8 @@ class DefaultRagService:
             if ranked:
                 logger.info("Rerank order: %s", [d.doc_id for d in ranked])
                 return ranked
+        except (APIConnectionError, APITimeoutError) as exc:
+            logger.error("Rerank failed: cannot connect to OpenAI (%s); using vector order", exc, exc_info=True)
         except Exception as exc:  # never let rerank break the flow
             logger.warning("Rerank failed (%s); using vector order", exc)
         return candidates
