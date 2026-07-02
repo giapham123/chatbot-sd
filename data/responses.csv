@@ -1,0 +1,5 @@
+response_key,text,variables
+welcome,Chào mừng Anh/Chị đã liên hệ Công ty Tài Chính TNHH MTV Mirae Asset (Việt Nam). Anh/Chị đang được hỗ trợ bởi Trợ lý ảo (AI Chatbot). Anh/Chị vui lòng cho em biết đang cần hỗ trợ vấn đề gì ạ?,
+fb_ask,"Xin lỗi, hiện em chưa hỗ trợ được nội dung này. Anh/Chị vui lòng cung cấp MSNV hoặc email công ty (@mafc.com.vn) để em chuyển thông tin cho quản trị viên (administrator) hỗ trợ ạ.",
+fb_done,Cảm ơn Anh/Chị. Em đã ghi nhận và chuyển MSNV/email cùng yêu cầu của Anh/Chị đến quản trị viên hỗ trợ. Anh/Chị vui lòng chờ được liên hệ lại ạ.,
+handoff_sd,Cám ơn thông tin Anh/Chị cung cấp. Nội dung yêu cầu của Anh/Chị đã được chuyển cho nhân viên hỗ trợ trực tiếp…,
