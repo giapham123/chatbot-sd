@@ -1,4 +1,4 @@
-"""Domain models (data sheets + conversation events).
+"""Domain models (data sheets).
 
 Plain, immutable-ish dataclasses. No behavior, no I/O — keeps the domain
 decoupled from persistence and framework concerns (SRP).
@@ -6,7 +6,6 @@ decoupled from persistence and framework concerns (SRP).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum
 
 
 # --------------------------------------------------------------------------- #
@@ -38,25 +37,3 @@ class KBDoc:
 
     def as_text(self) -> str:
         return f"Q: {self.question}\nA: {self.answer}"
-
-
-# --------------------------------------------------------------------------- #
-# Conversation output — "emissions" the engine/services produce each turn.
-# The transport layer (SSE) decides how to render them.
-# --------------------------------------------------------------------------- #
-class EmissionKind(str, Enum):
-    TEXT = "text"            # fixed scripted message -> send as one chunk
-    RAG_ANSWER = "rag"       # needs token streaming from the LLM
-    HANDOFF = "handoff"      # control: transferred to human SD
-    END = "end"             # control: conversation ended
-
-
-@dataclass
-class Emission:
-    kind: EmissionKind
-    text: str = ""
-    # for RAG_ANSWER:
-    query: str = ""
-    context: list[KBDoc] = field(default_factory=list)
-    doc_ids: list[str] = field(default_factory=list)
-    identify: int = 2  # 1=identified (MSNV received), 2=not yet

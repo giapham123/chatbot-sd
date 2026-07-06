@@ -1,11 +1,10 @@
-"""RAG service: retrieve from KB then call LLM with SD rules.
+"""RAG service: retrieve from KB then stream response tokens from the LLM.
 
 Pipeline per turn:
   1. contextualize  → rewrite follow-up into standalone query
   2. embed + search → pull top candidates from Qdrant (>= min_score)
   3. rerank         → cheap LLM reorders by true relevance
-  4. answer_async   → main LLM returns structured JSON:
-                       {response, conversation_status, identify, error_email}
+  4. answer_stream  → main LLM streams JSON, yields response tokens then result dict
 """
 from __future__ import annotations
 
@@ -19,6 +18,27 @@ from ..domain.interfaces import EmbeddingClient, KnowledgeRepository, LLMClient,
 from ..prompt.en_system_prompt_sd import AGENT_SYSTEM_PROMPT_SD, RERANK_PROMPT, REWRITE_PROMPT
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_until_quote(text: str, escape_next: bool) -> tuple[str, bool, bool]:
+    """Extract chars from a streaming JSON string value until the closing unescaped quote.
+
+    Returns: (extracted_content, still_inside_value, new_escape_next_state)
+    """
+    out: list[str] = []
+    in_value = True
+    for c in text:
+        if escape_next:
+            escape_next = False
+            out.append({"n": "\n", "t": "\t", "r": "\r"}.get(c, c))
+        elif c == "\\":
+            escape_next = True
+        elif c == '"':
+            in_value = False
+            break
+        else:
+            out.append(c)
+    return "".join(out), in_value, escape_next
 
 
 class DefaultRagService:
@@ -44,17 +64,60 @@ class DefaultRagService:
         self._fallback_message = fallback_message
         self._rerank_candidates = max(rerank_candidates, top_k)
 
-    async def answer_async(
+    async def answer_stream(
         self,
         query: str,
         history: list[tuple[str, str]],
         conversation_status: int = 0,
         error_email: int = 0,
-    ) -> dict:
-        """Retrieve KB context, call main LLM with SD rules, return structured dict.
+    ) -> AsyncIterator[str | dict]:
+        """Yield response text tokens (str) as the LLM streams, then the result dict.
 
-        Returns: {response, conversation_status, identify, error_email}
+        Streams via stream=True + response_format=json_object, extracts only the
+        'response' field value as clean text tokens, and yields the full parsed
+        result dict as the final item.
         """
+        messages = await self._build_messages(query, history, conversation_status, error_email)
+
+        raw_parts: list[str] = []
+        in_response = False
+        escape_next = False
+        search_buf = ""
+
+        async for chunk in self._llm.stream_json(messages):
+            raw_parts.append(chunk)
+
+            if not in_response:
+                search_buf += chunk
+                m = re.search(r'"response"\s*:\s*"', search_buf)
+                if m:
+                    in_response = True
+                    after = search_buf[m.end():]
+                    search_buf = ""
+                    content, in_response, escape_next = _extract_until_quote(after, escape_next)
+                    if content:
+                        yield content
+            else:
+                content, in_response, escape_next = _extract_until_quote(chunk, escape_next)
+                if content:
+                    yield content
+
+        raw = "".join(raw_parts)
+        logger.debug("LLM stream accumulated: %r", raw)
+        yield self._parse_structured(raw)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    async def _build_messages(
+        self,
+        query: str,
+        history: list[tuple[str, str]],
+        conversation_status: int,
+        error_email: int,
+    ) -> list[dict]:
+        """Run the full RAG pipeline and return the assembled LLM message list."""
         standalone = await self._contextualize(query, history)
 
         context_texts: list[str] = []
@@ -70,7 +133,6 @@ class DefaultRagService:
                 ranked = await self._rerank(standalone, candidates)
                 context_texts = [d.as_text() for d in ranked[: self._top_k]]
 
-        # Extract the last bot message for anti-loop checking in the prompt.
         last_bot_msg = ""
         for role, text in reversed(history):
             if role == "bot":
@@ -93,7 +155,6 @@ class DefaultRagService:
             if last_bot_msg else ""
         )
 
-        # Build a compact text summary of history for the LLM to reference explicitly.
         history_summary = ""
         if history:
             lines = []
@@ -112,25 +173,7 @@ class DefaultRagService:
             ),
         })
 
-        raw = await self._llm.complete_json(messages)
-        logger.debug("LLM raw response: %r", raw)
-        return self._parse_structured(raw)
-
-    async def stream_answer(
-        self,
-        query: str,
-        context: list[str],
-        history: list[tuple[str, str]],
-        conversation_status: int = 0,
-        error_email: int = 0,
-    ) -> AsyncIterator[str]:
-        """Yields the response text (single chunk) for WebSocket token streaming."""
-        result = await self.answer_async(query, history, conversation_status, error_email)
-        yield result.get("response", self._fallback_message)
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
+        return messages
 
     def _parse_structured(self, raw: str) -> dict:
         """Extract {response, conversation_status, identify, error_email} from LLM output."""

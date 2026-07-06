@@ -21,6 +21,12 @@ class QdrantVectorStore:
         self._client = client
         self._collection = collection
 
+    async def connect(self) -> None:
+        """Verify Qdrant is reachable and the collection exists at startup."""
+        info = await self._client.get_collection(self._collection)
+        points = getattr(info, "points_count", None) or getattr(info, "vectors_count", None)
+        logger.info("Qdrant connected: collection=%s points=%s", self._collection, points)
+
     async def search(self, vector: list[float], top_k: int) -> list[tuple[str, float]]:
         resp = await self._client.query_points(
             collection_name=self._collection,

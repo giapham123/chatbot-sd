@@ -15,18 +15,6 @@ class OpenAILLMClient:
         self._client = client
         self._chat_model = chat_model
 
-    async def stream(self, messages: list[dict]) -> AsyncIterator[str]:
-        stream = await self._client.chat.completions.create(
-            model=self._chat_model,
-            temperature=0.2,
-            stream=True,
-            messages=messages,
-        )
-        async for chunk in stream:
-            delta = chunk.choices[0].delta.content
-            if delta:
-                yield delta
-
     async def complete(self, messages: list[dict]) -> str:
         resp = await self._client.chat.completions.create(
             model=self._chat_model,
@@ -44,6 +32,20 @@ class OpenAILLMClient:
             messages=messages,
         )
         return resp.choices[0].message.content or ""
+
+    async def stream_json(self, messages: list[dict]) -> AsyncIterator[str]:
+        """Stream chunks from a JSON-format LLM call (stream=True + json_object)."""
+        stream = await self._client.chat.completions.create(
+            model=self._chat_model,
+            temperature=0,
+            response_format={"type": "json_object"},
+            stream=True,
+            messages=messages,
+        )
+        async for chunk in stream:
+            delta = chunk.choices[0].delta.content
+            if delta:
+                yield delta
 
 
 class OpenAIEmbeddingClient:

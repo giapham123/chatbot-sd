@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import AsyncIterator, Optional, Protocol
 
-from .models import ActionDef, Emission, KBDoc
+from .models import ActionDef, KBDoc
 
 
 # --------------------------------------------------------------------------- #
@@ -34,12 +34,14 @@ class EmbeddingClient(Protocol):
 
 
 class LLMClient(Protocol):
-    async def stream(self, messages: list[dict]) -> AsyncIterator[str]: ...
     async def complete(self, messages: list[dict]) -> str:
         """One-shot completion — used for query rewrite / rerank."""
         ...
     async def complete_json(self, messages: list[dict]) -> str:
         """Like complete() but forces JSON output via response_format."""
+        ...
+    async def stream_json(self, messages: list[dict]) -> AsyncIterator[str]:
+        """Stream tokens from a JSON-format completion (stream=True + json_object)."""
         ...
 
 
@@ -52,19 +54,3 @@ class VectorStore(Protocol):
 class ActionExecutor(Protocol):
     """Performs a side effect (e.g. forward an unanswered request to the admin)."""
     def execute(self, action: ActionDef, session_id: str, slots: dict[str, str]) -> None: ...
-
-
-class RagService(Protocol):
-    async def plan_async(
-        self, query: str, history: Optional[list[tuple[str, str]]] = None
-    ) -> Emission:
-        """Retrieve context and decide: answerable (RAG_ANSWER) or handoff.
-
-        `history` (prior turns) is used to rewrite follow-up questions into a
-        standalone query before retrieval.
-        """
-        ...
-
-    def stream_answer(
-        self, query: str, context: list[str], history: list[tuple[str, str]]
-    ) -> AsyncIterator[str]: ...

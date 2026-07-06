@@ -8,7 +8,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
-from langgraph.checkpoint.memory import MemorySaver
 from openai import AsyncOpenAI
 from qdrant_client import AsyncQdrantClient
 
@@ -17,7 +16,6 @@ from .kafka.consumer import KafkaConsumerService
 from .kafka.producer import KafkaProducerService
 from .orchestration.conversation import ConversationService
 from .ws.ws_service import WebsocketClient
-from .orchestration.graph import build_conversation_graph
 from .services.llm import OpenAIEmbeddingClient, OpenAILLMClient
 from .services.rag import DefaultRagService
 from .repositories.csv_repositories import CsvDataContext
@@ -51,7 +49,7 @@ async def build_container(settings: Settings) -> Container:
     # Vectors live in Qdrant (populated by scripts/embed_to_qdrant.py) — nothing in RAM.
     qdrant_client = AsyncQdrantClient(url=settings.qdrant_url, api_key=settings.qdrant_api_key)
     vector_store = QdrantVectorStore(qdrant_client, settings.qdrant_collection)
-    checkpointer = MemorySaver()
+    await vector_store.connect()
 
     rag = DefaultRagService(
         embedder=embedder,
@@ -65,8 +63,7 @@ async def build_container(settings: Settings) -> Container:
         rerank_candidates=settings.rerank_candidates,
     )
 
-    graph = build_conversation_graph(rag=rag, checkpointer=checkpointer)
-    conversation = ConversationService(graph, settings.history_turns)
+    conversation = ConversationService(rag, settings.history_turns)
 
     kafka_consumer: Optional[KafkaConsumerService] = None
     kafka_producer: Optional[KafkaProducerService] = None

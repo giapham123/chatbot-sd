@@ -1,8 +1,7 @@
-"""ConversationService — orchestrates one SD turn via LangGraph.
+"""ConversationService — orchestrates one SD turn with real LLM token streaming.
 
-Runs the graph for one turn, extracts structured fields from the TEXT emission
-({response, conversation_status, identify, error_email}), and yields StreamEvents
-so the Kafka handler can forward them to bot-agent.
+Calls the RAG service directly (bypassing LangGraph) for the streaming path.
+The graph is kept for non-streaming callers (e.g. the /chat SSE endpoint).
 
 Chat history is kept client-side and sent per request as LangChain format
 ([{"type": "human"|"ai", "content": "..."}]); the Kafka layer converts it to
@@ -12,9 +11,9 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any, AsyncIterator
+from typing import AsyncIterator
 
-from ..domain.models import EmissionKind
+from ..services.rag import DefaultRagService
 
 
 @dataclass
@@ -24,8 +23,8 @@ class StreamEvent:
 
 
 class ConversationService:
-    def __init__(self, graph: Any, history_turns: int = 6) -> None:
-        self._graph = graph
+    def __init__(self, rag: DefaultRagService, history_turns: int = 6) -> None:
+        self._rag = rag
         self._history_turns = history_turns
 
     async def stream(
@@ -42,34 +41,24 @@ class ConversationService:
     ) -> AsyncIterator[StreamEvent]:
         history = (history or [])[-self._history_turns:]
 
-        config = {"configurable": {"thread_id": channel_id}}
-        state = await self._graph.ainvoke(
-            {
-                "user_input": user_input,
-                "channel_id": channel_id,
-                "agent_id": agent_id or "",
-                "platform": platform,
-                "history": history,
-                "conversation_status": conversation_status,
-                "error_email": error_email,
-            },
-            config,
-        )
+        answer_parts: list[str] = []
+        result: dict = {}
 
-        answer = ""
-        out_conversation_status = 1
-        out_identify = 2
-        out_error_email = 0
+        async for item in self._rag.answer_stream(
+            user_input, history, conversation_status, error_email
+        ):
+            if isinstance(item, str):
+                answer_parts.append(item)
+                yield StreamEvent("token", item)
+            else:
+                result = item
 
-        for em in state.get("emissions", []):
-            if em.get("kind") == EmissionKind.TEXT.value:
-                answer = em.get("text", "")
-                out_conversation_status = em.get("conversation_status", 1)
-                out_identify = em.get("identify", 2)
-                out_error_email = em.get("error_email", 0)
-                # Yield the full answer as one token so WebSocket gets the text.
-                yield StreamEvent("token", answer)
-                yield StreamEvent("message_end")
+        answer = "".join(answer_parts)
+        yield StreamEvent("message_end")
+
+        out_conversation_status = result.get("conversation_status", 1)
+        out_identify = result.get("identify", 2)
+        out_error_email = result.get("error_email", 0)
 
         out_chat_history = [
             *({"type": "human" if r == "user" else "ai", "content": t} for r, t in history),
@@ -77,7 +66,6 @@ class ConversationService:
             {"type": "ai", "content": answer},
         ]
 
-        # Merge updated error_email back into the error dict for round-trip state.
         out_error = dict(error or {})
         out_error["error_email"] = out_error_email
 
