@@ -37,6 +37,12 @@ class Settings:
     # WebSocket (SocketCluster)
     ws_enabled: bool
     ws_url: str
+    # Langfuse observability
+    langfuse_enabled: bool
+    langfuse_secret_key: str
+    langfuse_public_key: str
+    langfuse_host: str
+    langfuse_timeout: int   # milliseconds
 
     @staticmethod
     def load() -> "Settings":
@@ -61,4 +67,9 @@ class Settings:
             kafka_group_id=os.getenv("KAFKA_GROUP_ID", "ai-agent-consumer"),
             ws_enabled=os.getenv("WS_ENABLED", "false").lower() == "true",
             ws_url=os.getenv("WS_URL", "ws://localhost:8001/socketcluster/"),
+            langfuse_enabled=os.getenv("LANGFUSE_ENABLED", "false").lower() == "true",
+            langfuse_secret_key=os.getenv("LANGFUSE_SECRET_KEY", ""),
+            langfuse_public_key=os.getenv("LANGFUSE_PUBLIC_KEY", ""),
+            langfuse_host=os.getenv("LANGFUSE_BASE_URL", "https://cloud.langfuse.com"),
+            langfuse_timeout=int(os.getenv("LANGFUSE_TIMEOUT", "5000")),
         )

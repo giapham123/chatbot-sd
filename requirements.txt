@@ -6,3 +6,4 @@ python-dotenv>=1.0.0
 pydantic>=2.6.0
 qdrant-client>=1.7.0
 aiokafka>=0.11.0
+langfuse>=2.58.0

@@ -38,6 +38,10 @@ class ConversationService:
         conversation_status: int = 0,
         error_email: int = 0,
         error: dict | None = None,
+        lf_session_id: str | None = None,
+        lf_trace_name: str = "chat_sd",
+        lf_metadata: dict | None = None,
+        lf_tags: list[str] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         history = (history or [])[-self._history_turns:]
 
@@ -45,7 +49,11 @@ class ConversationService:
         result: dict = {}
 
         async for item in self._rag.answer_stream(
-            user_input, history, conversation_status, error_email
+            user_input, history, conversation_status, error_email,
+            lf_session_id=lf_session_id,
+            lf_trace_name=lf_trace_name,
+            lf_metadata=lf_metadata,
+            lf_tags=lf_tags,
         ):
             if isinstance(item, str):
                 answer_parts.append(item)

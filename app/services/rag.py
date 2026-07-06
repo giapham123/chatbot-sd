@@ -70,21 +70,43 @@ class DefaultRagService:
         history: list[tuple[str, str]],
         conversation_status: int = 0,
         error_email: int = 0,
+        *,
+        lf_session_id: str | None = None,
+        lf_trace_name: str = "chat_sd",
+        lf_metadata: dict | None = None,
+        lf_tags: list[str] | None = None,
     ) -> AsyncIterator[str | dict]:
         """Yield response text tokens (str) as the LLM streams, then the result dict.
 
         Streams via stream=True + response_format=json_object, extracts only the
         'response' field value as clean text tokens, and yields the full parsed
         result dict as the final item.
+
+        lf_* kwargs are forwarded to every OpenAI call so that langfuse.openai
+        wrapper links them to the correct session/trace in Langfuse.
         """
-        messages = await self._build_messages(query, history, conversation_status, error_email)
+        # Build Langfuse per-call kwargs forwarded to every OpenAI create() call.
+        # Only kwargs explicitly listed in OpenAiArgsExtractor.__init__ are stripped
+        # before reaching the real OpenAI API — session_id/tags are NOT stripped in
+        # Langfuse 4.x (bug), so we embed them inside metadata instead.
+        lf: dict = {}
+        if lf_session_id:
+            lf["metadata"] = {
+                **(lf_metadata or {}),
+                "session_id": lf_session_id,
+                "tags": lf_tags or ["chat", "chatbot-sd", "SD"],
+            }
+
+        messages = await self._build_messages(
+            query, history, conversation_status, error_email, lf=lf
+        )
 
         raw_parts: list[str] = []
         in_response = False
         escape_next = False
         search_buf = ""
 
-        async for chunk in self._llm.stream_json(messages):
+        async for chunk in self._llm.stream_json(messages, name=lf_trace_name, **lf):
             raw_parts.append(chunk)
 
             if not in_response:
@@ -116,6 +138,7 @@ class DefaultRagService:
         history: list[tuple[str, str]],
         conversation_status: int,
         error_email: int,
+        lf: dict | None = None,
     ) -> list[dict]:
         """Run the full RAG pipeline and return the assembled LLM message list."""
         standalone = await self._contextualize(query, history)
