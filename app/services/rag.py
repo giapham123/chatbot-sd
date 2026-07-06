@@ -16,7 +16,7 @@ from typing import AsyncIterator
 
 from openai import APIConnectionError, APITimeoutError
 from ..domain.interfaces import EmbeddingClient, KnowledgeRepository, LLMClient, VectorStore
-from ..prompt.system_prompt_sd import AGENT_SYSTEM_PROMPT_SD, RERANK_PROMPT, REWRITE_PROMPT
+from ..prompt.en_system_prompt_sd import AGENT_SYSTEM_PROMPT_SD, RERANK_PROMPT, REWRITE_PROMPT
 
 logger = logging.getLogger(__name__)
 
