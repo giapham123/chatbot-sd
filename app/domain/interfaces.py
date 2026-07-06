@@ -36,7 +36,10 @@ class EmbeddingClient(Protocol):
 class LLMClient(Protocol):
     async def stream(self, messages: list[dict]) -> AsyncIterator[str]: ...
     async def complete(self, messages: list[dict]) -> str:
-        """One-shot (non-streaming) completion — used for query rewrite / rerank."""
+        """One-shot completion — used for query rewrite / rerank."""
+        ...
+    async def complete_json(self, messages: list[dict]) -> str:
+        """Like complete() but forces JSON output via response_format."""
         ...
 
 

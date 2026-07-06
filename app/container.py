@@ -12,7 +12,6 @@ from langgraph.checkpoint.memory import MemorySaver
 from openai import AsyncOpenAI
 from qdrant_client import AsyncQdrantClient
 
-from .services.actions import LoggingActionExecutor
 from .config import Settings
 from .kafka.consumer import KafkaConsumerService
 from .kafka.producer import KafkaProducerService
@@ -52,13 +51,8 @@ async def build_container(settings: Settings) -> Container:
     # Vectors live in Qdrant (populated by scripts/embed_to_qdrant.py) — nothing in RAM.
     qdrant_client = AsyncQdrantClient(url=settings.qdrant_url, api_key=settings.qdrant_api_key)
     vector_store = QdrantVectorStore(qdrant_client, settings.qdrant_collection)
-    action_executor = LoggingActionExecutor()
-
-    # Graph state (greeted / awaiting_admin) lives in RAM, keyed by session_id.
-    # Lost on restart — chat history is kept client-side in localStorage instead.
     checkpointer = MemorySaver()
 
-    # Services — conversational RAG (no scripted flows)
     rag = DefaultRagService(
         embedder=embedder,
         vector_store=vector_store,
@@ -71,16 +65,8 @@ async def build_container(settings: Settings) -> Container:
         rerank_candidates=settings.rerank_candidates,
     )
 
-    graph = build_conversation_graph(
-        rag=rag,
-        action_executor=action_executor,
-        welcome_text=data.responses.text("welcome"),
-        ask_msnv_text=data.responses.text("fb_ask"),
-        forwarded_text=data.responses.text("fb_done"),
-        notify_action=data.actions.get("notify_admin"),
-        checkpointer=checkpointer,
-    )
-    conversation = ConversationService(graph, rag, settings.history_turns)
+    graph = build_conversation_graph(rag=rag, checkpointer=checkpointer)
+    conversation = ConversationService(graph, settings.history_turns)
 
     kafka_consumer: Optional[KafkaConsumerService] = None
     kafka_producer: Optional[KafkaProducerService] = None

@@ -1,46 +1,24 @@
-"""RAG service: retrieve from the KB and decide answerability
-(implements interfaces.RagService).
+"""RAG service: retrieve from KB then call LLM with SD rules.
 
-Pipeline per query:
-  1. contextualize  -> rewrite a follow-up into a standalone query using history
-  2. embed + search -> pull the top candidates from Qdrant (>= min_score)
-  3. rerank         -> a cheap LLM reorders the candidates by true relevance
-  4. decide         -> strong candidates -> RAG_ANSWER (grounded, streamed reply)
-                       none               -> HANDOFF (collect MSNV/email for admin)
+Pipeline per turn:
+  1. contextualize  → rewrite follow-up into standalone query
+  2. embed + search → pull top candidates from Qdrant (>= min_score)
+  3. rerank         → cheap LLM reorders by true relevance
+  4. answer_async   → main LLM returns structured JSON:
+                       {response, conversation_status, identify, error_email}
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
-from typing import AsyncIterator, Optional
+from typing import AsyncIterator
 
 from openai import APIConnectionError, APITimeoutError
 from ..domain.interfaces import EmbeddingClient, KnowledgeRepository, LLMClient, VectorStore
-from ..domain.models import Emission, EmissionKind, KBDoc
+from ..prompt.system_prompt_sd import AGENT_SYSTEM_PROMPT_SD, RERANK_PROMPT, REWRITE_PROMPT
 
 logger = logging.getLogger(__name__)
-
-SYSTEM_PROMPT = (
-    "Bạn là Trợ lý ảo Service Desk của Công ty Tài chính Mirae Asset (MAFC). "
-    "Hãy trả lời như một nhân viên hỗ trợ thật: thân thiện, tự nhiên, ngắn gọn, "
-    "bằng tiếng Việt, xưng 'em' và gọi khách là 'Anh/Chị'. "
-    "Ưu tiên dùng thông tin trong NGỮ CẢNH và lịch sử trò chuyện để trả lời đúng trọng tâm. "
-    "Nếu là lời chào/cảm ơn/trò chuyện xã giao thì đáp lại lịch sự, ngắn gọn. "
-    "TUYỆT ĐỐI không bịa thông tin không có trong ngữ cảnh; nếu không chắc, hãy nói rằng "
-    "em sẽ hỗ trợ chuyển tiếp cho bộ phận phù hợp."
-)
-
-REWRITE_PROMPT = (
-    "Bạn viết lại câu hỏi mới nhất của người dùng thành MỘT câu hỏi độc lập, đầy đủ ngữ cảnh "
-    "dựa trên lịch sử trò chuyện (thay các từ như 'nó', 'cái đó', 'vẫn vậy' bằng nội dung cụ thể). "
-    "Giữ nguyên ngôn ngữ tiếng Việt. CHỈ trả về đúng câu hỏi, không giải thích."
-)
-
-RERANK_PROMPT = (
-    "Bạn xếp hạng các mục kiến thức theo mức độ phù hợp để trả lời CÂU HỎI. "
-    "Chỉ trả về các số thứ tự (index) của những mục phù hợp, xếp giảm dần theo độ liên quan, "
-    "cách nhau bằng dấu phẩy. Bỏ qua các mục không liên quan. Ví dụ: 2,0,1"
-)
 
 
 class DefaultRagService:
@@ -66,32 +44,117 @@ class DefaultRagService:
         self._fallback_message = fallback_message
         self._rerank_candidates = max(rerank_candidates, top_k)
 
-    async def plan_async(
-        self, query: str, history: Optional[list[tuple[str, str]]] = None
-    ) -> Emission:
-        # 1) Rewrite follow-ups into a standalone query for better retrieval.
-        standalone = await self._contextualize(query, history or [])
+    async def answer_async(
+        self,
+        query: str,
+        history: list[tuple[str, str]],
+        conversation_status: int = 0,
+        error_email: int = 0,
+    ) -> dict:
+        """Retrieve KB context, call main LLM with SD rules, return structured dict.
 
-        # 2) Embed + retrieve a wider candidate set (for reranking).
+        Returns: {response, conversation_status, identify, error_email}
+        """
+        standalone = await self._contextualize(query, history)
+
+        context_texts: list[str] = []
         vectors = await self._embedder.embed([standalone])
-        if not vectors:
-            return self._fallback()
-        hits = await self._store.search(vectors[0], self._rerank_candidates)
-        candidates = [
-            self._docs[doc_id]
-            for doc_id, score in hits
-            if score >= self._min_score and doc_id in self._docs
-        ]
-        if not candidates:
-            return self._fallback()
+        if vectors:
+            hits = await self._store.search(vectors[0], self._rerank_candidates)
+            candidates = [
+                self._docs[doc_id]
+                for doc_id, score in hits
+                if score >= self._min_score and doc_id in self._docs
+            ]
+            if candidates:
+                ranked = await self._rerank(standalone, candidates)
+                context_texts = [d.as_text() for d in ranked[: self._top_k]]
 
-        # 3) Rerank, then keep the top_k most relevant.
-        ranked = await self._rerank(standalone, candidates)
-        context = ranked[: self._top_k]
-        return Emission(kind=EmissionKind.RAG_ANSWER, query=query, context=context)
+        # Extract the last bot message for anti-loop checking in the prompt.
+        last_bot_msg = ""
+        for role, text in reversed(history):
+            if role == "bot":
+                last_bot_msg = text
+                break
+
+        system = AGENT_SYSTEM_PROMPT_SD.format(
+            conversation_status=conversation_status,
+            error_email=error_email,
+        )
+
+        messages: list[dict] = [{"role": "system", "content": system}]
+        for role, text in history:
+            messages.append({"role": "assistant" if role == "bot" else "user", "content": text})
+
+        joined = "\n\n".join(context_texts) if context_texts else "(không có ngữ cảnh)"
+
+        last_bot_hint = (
+            f"\n\n⚠️ TIN NHẮN BOT GẦN NHẤT (KHÔNG được lặp lại): \"{last_bot_msg}\""
+            if last_bot_msg else ""
+        )
+
+        # Build a compact text summary of history for the LLM to reference explicitly.
+        history_summary = ""
+        if history:
+            lines = []
+            for role, text in history:
+                label = "Khách" if role == "user" else "Bot"
+                lines.append(f"{label}: {text}")
+            history_summary = "\n\nTÓM TẮT LỊCH SỬ HỘI THOẠI:\n" + "\n".join(lines)
+
+        messages.append({
+            "role": "user",
+            "content": (
+                f"NGỮ CẢNH KB:\n{joined}"
+                f"{history_summary}"
+                f"{last_bot_hint}"
+                f"\n\nCÂU HỎI HIỆN TẠI: {query}"
+            ),
+        })
+
+        raw = await self._llm.complete_json(messages)
+        logger.debug("LLM raw response: %r", raw)
+        return self._parse_structured(raw)
+
+    async def stream_answer(
+        self,
+        query: str,
+        context: list[str],
+        history: list[tuple[str, str]],
+        conversation_status: int = 0,
+        error_email: int = 0,
+    ) -> AsyncIterator[str]:
+        """Yields the response text (single chunk) for WebSocket token streaming."""
+        result = await self.answer_async(query, history, conversation_status, error_email)
+        yield result.get("response", self._fallback_message)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _parse_structured(self, raw: str) -> dict:
+        """Extract {response, conversation_status, identify, error_email} from LLM output."""
+        try:
+            text = re.sub(r"```(?:json)?", "", raw).strip().strip("`")
+            m = re.search(r"\{.*\}", text, re.DOTALL)
+            if m:
+                data = json.loads(m.group())
+                return {
+                    "response": str(data.get("response", self._fallback_message)).strip(),
+                    "conversation_status": int(data.get("conversation_status", 1)),
+                    "identify": int(data.get("identify", 2)),
+                    "error_email": int(data.get("error_email", 0)),
+                }
+        except Exception as exc:
+            logger.warning("Failed to parse LLM JSON (%s): %r", exc, raw)
+        return {
+            "response": self._fallback_message,
+            "conversation_status": 2,
+            "identify": 2,
+            "error_email": 0,
+        }
 
     async def _contextualize(self, query: str, history: list[tuple[str, str]]) -> str:
-        """Rewrite a follow-up into a standalone query (no-op on first turn)."""
         if not history:
             return query
         try:
@@ -106,13 +169,12 @@ class DefaultRagService:
                 logger.info("Query rewrite: %r -> %r", query, rewritten)
                 return rewritten
         except (APIConnectionError, APITimeoutError) as exc:
-            logger.error("Query rewrite failed: cannot connect to OpenAI (%s); using original query", exc, exc_info=True)
-        except Exception as exc:  # never let rewrite break the flow
+            logger.error("Query rewrite failed (%s); using original query", exc, exc_info=True)
+        except Exception as exc:
             logger.warning("Query rewrite failed (%s); using original query", exc)
         return query
 
-    async def _rerank(self, query: str, candidates: list[KBDoc]) -> list[KBDoc]:
-        """LLM reorders candidates by relevance; falls back to vector order."""
+    async def _rerank(self, query: str, candidates: list) -> list:
         if len(candidates) <= 1:
             return candidates
         try:
@@ -131,32 +193,12 @@ class DefaultRagService:
                 for i in order
                 if 0 <= i < len(candidates) and not (i in seen or seen.add(i))
             ]
-            # Keep any candidates the LLM omitted (preserve their vector order).
             ranked += [d for i, d in enumerate(candidates) if i not in seen]
             if ranked:
                 logger.info("Rerank order: %s", [d.doc_id for d in ranked])
                 return ranked
         except (APIConnectionError, APITimeoutError) as exc:
-            logger.error("Rerank failed: cannot connect to OpenAI (%s); using vector order", exc, exc_info=True)
-        except Exception as exc:  # never let rerank break the flow
+            logger.error("Rerank failed (%s); using vector order", exc, exc_info=True)
+        except Exception as exc:
             logger.warning("Rerank failed (%s); using vector order", exc)
         return candidates
-
-    def _fallback(self) -> Emission:
-        # Can't answer -> forward to a human (nhân viên hỗ trợ / SD).
-        return Emission(kind=EmissionKind.HANDOFF, text=self._fallback_message)
-
-    async def stream_answer(
-        self, query: str, context: list[str], history: list[tuple[str, str]]
-    ) -> AsyncIterator[str]:
-        messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
-        # Prior turns give the model multi-turn context (follow-up questions).
-        for role, text in history:
-            if role == "user":
-                messages.append({"role": "user", "content": text})
-            elif role == "bot":
-                messages.append({"role": "assistant", "content": text})
-        joined = "\n\n".join(context) if context else "(không có ngữ cảnh — trả lời xã giao/tự nhiên)"
-        messages.append({"role": "user", "content": f"NGỮ CẢNH:\n{joined}\n\nCÂU HỎI: {query}"})
-        async for token in self._llm.stream(messages):
-            yield token

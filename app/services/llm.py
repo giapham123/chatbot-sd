@@ -35,6 +35,16 @@ class OpenAILLMClient:
         )
         return resp.choices[0].message.content or ""
 
+    async def complete_json(self, messages: list[dict]) -> str:
+        """Like complete() but forces JSON output via response_format."""
+        resp = await self._client.chat.completions.create(
+            model=self._chat_model,
+            temperature=0,
+            response_format={"type": "json_object"},
+            messages=messages,
+        )
+        return resp.choices[0].message.content or ""
+
 
 class OpenAIEmbeddingClient:
     def __init__(self, client: AsyncOpenAI, model: str) -> None:
