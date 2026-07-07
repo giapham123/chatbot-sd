@@ -84,6 +84,7 @@ async def build_container(settings: Settings) -> Container:
         min_score=settings.rag_min_score,
         fallback_message=data.responses.text("handoff_sd"),
         rerank_candidates=settings.rerank_candidates,
+        chat_model=settings.chat_model,
     )
 
     conversation = ConversationService(rag, settings.history_turns)

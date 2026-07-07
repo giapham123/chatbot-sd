@@ -54,6 +54,7 @@ class DefaultRagService:
         min_score: float,
         fallback_message: str,
         rerank_candidates: int = 8,
+        chat_model: str = "",
     ) -> None:
         self._embedder = embedder
         self._store = vector_store
@@ -64,6 +65,7 @@ class DefaultRagService:
         self._min_score = min_score
         self._fallback_message = fallback_message
         self._rerank_candidates = max(rerank_candidates, top_k)
+        self._chat_model = chat_model
 
     async def answer_stream(
         self,
@@ -107,8 +109,13 @@ class DefaultRagService:
         in_response = False
         escape_next = False
         search_buf = ""
+        usage_info: dict | None = None
 
         async for chunk in self._llm.stream_json(messages):
+            if isinstance(chunk, dict):
+                usage_info = chunk
+                continue
+
             raw_parts.append(chunk)
 
             if not in_response:
@@ -131,9 +138,18 @@ class DefaultRagService:
 
         if generation:
             try:
-                generation.update(output=raw)
+                usage_details = {
+                    "input": usage_info["prompt_tokens"],
+                    "output": usage_info["completion_tokens"],
+                    "total": usage_info["total_tokens"],
+                } if usage_info else None
+                generation.update(
+                    output=raw,
+                    model=self._chat_model or None,
+                    usage_details=usage_details,
+                )
                 generation.end()
-                logger.info("Langfuse: generation ended ok")
+                logger.info("Langfuse: generation ended ok (tokens=%s)", usage_info)
             except Exception as exc:
                 logger.error("Langfuse generation end failed: %s", exc, exc_info=True)
 
