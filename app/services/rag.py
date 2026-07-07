@@ -72,6 +72,7 @@ class DefaultRagService:
         conversation_status: int = 0,
         error_email: int = 0,
         *,
+        image_b64: list[tuple[str, str]] | None = None,
         lf_session_id: str | None = None,
         lf_trace_name: str = "chat_sd",
         lf_metadata: dict | None = None,
@@ -79,25 +80,28 @@ class DefaultRagService:
     ) -> AsyncIterator[str | dict]:
         """Yield response text tokens (str) as the LLM streams, then the result dict."""
         messages = await self._build_messages(
-            query, history, conversation_status, error_email
+            query, history, conversation_status, error_email, image_b64=image_b64
         )
 
         generation = None
         if langfuse_service.enabled:
             try:
-                from langfuse.types import TraceContext
-                trace_id = langfuse_service._client.create_trace_id(
-                    seed=lf_session_id,
-                )
-                generation = langfuse_service._client.start_observation(
-                    name=lf_trace_name,
-                    as_type="generation",
-                    trace_context=TraceContext(trace_id=trace_id),
-                    input=messages,
-                    metadata=lf_metadata,
-                )
+                from langfuse import propagate_attributes
+                logger.info("Langfuse: starting generation name=%s", lf_trace_name)
+                with propagate_attributes(
+                    session_id=lf_session_id,
+                    tags=lf_tags,
+                    trace_name=lf_trace_name,
+                ):
+                    generation = langfuse_service._client.start_observation(
+                        name=lf_trace_name,
+                        as_type="generation",
+                        input=messages,
+                        metadata=lf_metadata,
+                    )
+                logger.info("Langfuse: generation started ok")
             except Exception as exc:
-                logger.warning("Langfuse generation start failed: %s", exc)
+                logger.error("Langfuse generation start failed: %s", exc, exc_info=True)
 
         raw_parts: list[str] = []
         in_response = False
@@ -129,8 +133,9 @@ class DefaultRagService:
             try:
                 generation.update(output=raw)
                 generation.end()
+                logger.info("Langfuse: generation ended ok")
             except Exception as exc:
-                logger.warning("Langfuse generation end failed: %s", exc)
+                logger.error("Langfuse generation end failed: %s", exc, exc_info=True)
 
         yield self._parse_structured(raw)
 
@@ -144,6 +149,7 @@ class DefaultRagService:
         history: list[tuple[str, str]],
         conversation_status: int,
         error_email: int,
+        image_b64: list[tuple[str, str]] | None = None,
     ) -> list[dict]:
         """Run the full RAG pipeline and return the assembled LLM message list."""
         standalone = await self._contextualize(query, history)
@@ -191,15 +197,23 @@ class DefaultRagService:
                 lines.append(f"{label}: {text}")
             history_summary = "\n\nTÓM TẮT LỊCH SỬ HỘI THOẠI:\n" + "\n".join(lines)
 
-        messages.append({
-            "role": "user",
-            "content": (
-                f"NGỮ CẢNH KB:\n{joined}"
-                f"{history_summary}"
-                f"{last_bot_hint}"
-                f"\n\nCÂU HỎI HIỆN TẠI: {query}"
-            ),
-        })
+        text = (
+            f"NGỮ CẢNH KB:\n{joined}"
+            f"{history_summary}"
+            f"{last_bot_hint}"
+            f"\n\nCÂU HỎI HIỆN TẠI: {query}"
+        )
+
+        if image_b64:
+            content: list[dict] = [{"type": "text", "text": text}]
+            for mime, b64 in image_b64:
+                content.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime};base64,{b64}"},
+                })
+            messages.append({"role": "user", "content": content})
+        else:
+            messages.append({"role": "user", "content": text})
 
         return messages
 

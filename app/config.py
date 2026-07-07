@@ -43,6 +43,13 @@ class Settings:
     langfuse_public_key: str
     langfuse_host: str
     langfuse_timeout: int   # milliseconds
+    # MinIO
+    minio_endpoint: str
+    minio_access_key: str
+    minio_secret_key: str
+    minio_secure: bool
+    minio_public_base_url: str
+    minio_bucket: str
 
     @staticmethod
     def load() -> "Settings":
@@ -72,4 +79,10 @@ class Settings:
             langfuse_public_key=os.getenv("LANGFUSE_PUBLIC_KEY", ""),
             langfuse_host=os.getenv("LANGFUSE_BASE_URL", "https://cloud.langfuse.com"),
             langfuse_timeout=int(os.getenv("LANGFUSE_TIMEOUT", "5000")),
+            minio_endpoint=os.getenv("MINIO_ENDPOINT", ""),
+            minio_access_key=os.getenv("MINIO_ACCESS_KEY", ""),
+            minio_secret_key=os.getenv("MINIO_SECRET_KEY", ""),
+            minio_secure=os.getenv("MINIO_SECURE", "false").lower() == "true",
+            minio_public_base_url=os.getenv("MINIO_PUBLIC_BASE_URL", ""),
+            minio_bucket=os.getenv("MINIO_BUCKET_NAME", "chatbotmafc"),
         )

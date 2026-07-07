@@ -50,9 +50,9 @@ class LangfuseService:
         if self._client:
             try:
                 self._client.flush()
-                logger.debug("Langfuse traces flushed")
+                logger.info("Langfuse: flush ok")
             except Exception as exc:
-                logger.warning("Langfuse flush failed: %s", exc)
+                logger.error("Langfuse flush failed: %s", exc, exc_info=True)
 
 
 # Module-level singleton — imported by container and handler

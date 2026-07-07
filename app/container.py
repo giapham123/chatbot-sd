@@ -20,6 +20,7 @@ from .ws.ws_service import WebsocketClient
 from .services.llm import OpenAIEmbeddingClient, OpenAILLMClient
 from .services.rag import DefaultRagService
 from .services.langfuse_service import langfuse_service
+from .services.minio_service import minio_service
 from .repositories.csv_repositories import CsvDataContext
 from .services.vector_store import QdrantVectorStore
 
@@ -50,6 +51,15 @@ async def build_container(settings: Settings) -> Container:
             host=settings.langfuse_host,
             timeout=settings.langfuse_timeout,
         )
+
+    minio_service.init(
+        endpoint=settings.minio_endpoint,
+        access_key=settings.minio_access_key,
+        secret_key=settings.minio_secret_key,
+        secure=settings.minio_secure,
+        public_base_url=settings.minio_public_base_url,
+        bucket=settings.minio_bucket,
+    )
 
     from openai import AsyncOpenAI
     client = AsyncOpenAI(api_key=settings.openai_api_key)

@@ -38,6 +38,7 @@ class ConversationService:
         conversation_status: int = 0,
         error_email: int = 0,
         error: dict | None = None,
+        image_b64: list[tuple[str, str]] | None = None,
         lf_session_id: str | None = None,
         lf_trace_name: str = "chat_sd",
         lf_metadata: dict | None = None,
@@ -50,6 +51,7 @@ class ConversationService:
 
         async for item in self._rag.answer_stream(
             user_input, history, conversation_status, error_email,
+            image_b64=image_b64,
             lf_session_id=lf_session_id,
             lf_trace_name=lf_trace_name,
             lf_metadata=lf_metadata,

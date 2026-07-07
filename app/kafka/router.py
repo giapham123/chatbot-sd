@@ -39,7 +39,7 @@ async def consume_loop(
     await consumer.start()
     await producer.start()
     try:
-        async for msg in consumer:
+         async for msg in consumer:
             try:
                 raw = json.loads(msg.value.decode("utf-8"))
                 uri = raw.get("uri", "")

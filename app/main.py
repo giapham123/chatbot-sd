@@ -29,6 +29,8 @@ from .config import Settings
 from .container import Container, build_container
 from .kafka.router import consume_loop
 from .orchestration.conversation import StreamEvent
+from .services.langfuse_service import langfuse_service
+from .services.minio_service import minio_service
 
 _container: Container | None = None
 
@@ -131,6 +133,15 @@ async def chat(req: ChatSDRequest) -> StreamingResponse:
     history = _lc_history_to_tuples(req.chat_history)
     channel_id = req.channel_id or str(uuid.uuid4())
 
+    platform = req.platform or "WEB"
+    raw_keys = req.image_url or []
+    image_detection = minio_service.get_image_urls(raw_keys, platform)
+    image_b64: list[tuple[str, str]] = []
+    for _key in raw_keys:
+        _result = await minio_service.aget_image_b64(_key)
+        if _result:
+            image_b64.append(_result)
+
     async def event_stream() -> AsyncIterator[str]:
         try:
             async for event in _container.conversation.stream(
@@ -138,15 +149,21 @@ async def chat(req: ChatSDRequest) -> StreamingResponse:
                 req.question or "",
                 history,
                 agent_id=req.agent_id,
-                platform=req.platform or "WEB",
+                platform=platform,
                 conversation_status=req.conversation_status,
                 error=req.error,
+                image_b64=image_b64,
             ):
+                if event.event == "output" and image_detection:
+                    output = json.loads(event.data)
+                    output["image_detection"] = image_detection
+                    event = StreamEvent("output", json.dumps(output, ensure_ascii=False))
                 yield _sse(event)
         except Exception as exc:
             yield _sse(StreamEvent("error", str(exc)))
         finally:
             yield "event: done\ndata: {}\n\n"
+            langfuse_service.flush()
 
     return StreamingResponse(
         event_stream(),

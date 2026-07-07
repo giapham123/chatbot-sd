@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 from ..orchestration.conversation import ConversationService
 from ..services.langfuse_service import langfuse_service
+from ..services.minio_service import minio_service
 from .batch import lc_to_tuples
 
 if TYPE_CHECKING:
@@ -42,6 +43,13 @@ async def handle_chat_sd(
     conversation_status = int(data.get("conversation_status") or 0)
     error_email         = _extract_error_email(data)
     error               = data.get("error") if isinstance(data.get("error"), dict) else {}
+    image_url       = data.get("image_url") or []
+    image_detection = minio_service.get_image_urls(image_url, platform)
+    image_b64: list[tuple[str, str]] = []
+    for _key in image_url:
+        _result = await minio_service.aget_image_b64(_key)
+        if _result:
+            image_b64.append(_result)
 
     if ws_client:
         await ws_client.send(agent_id, channel_id, message_id, "start", "")
@@ -64,6 +72,7 @@ async def handle_chat_sd(
             conversation_status=conversation_status,
             error_email=error_email,
             error=error,
+            image_b64=image_b64 or None,
             lf_session_id=channel_id,
             lf_trace_name=f"CHAT_SD_{platform.upper()}" if platform else "CHAT_SD",
             lf_metadata=lf_metadata,
@@ -89,8 +98,11 @@ async def handle_chat_sd(
             "tool_messages": None, "recursion_count": 0, "last_tool_name": "",
             "chat_history": None, "platform": platform,
             "conversation_status": 0, "identify": 2,
-            "error": {"error_email": error_email}, "extra": None, "image_detection": None,
+            "error": {"error_email": error_email}, "extra": None,
+            "image_detection": image_detection or None,
         }
+    else:
+        output["image_detection"] = image_detection or None
 
     if ws_client:
         await ws_client.send(
