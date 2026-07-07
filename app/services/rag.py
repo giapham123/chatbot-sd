@@ -16,6 +16,7 @@ from typing import AsyncIterator
 from openai import APIConnectionError, APITimeoutError
 from ..domain.interfaces import EmbeddingClient, KnowledgeRepository, LLMClient, VectorStore
 from ..prompt.en_system_prompt_sd import AGENT_SYSTEM_PROMPT_SD, RERANK_PROMPT, REWRITE_PROMPT
+from .langfuse_service import langfuse_service
 
 logger = logging.getLogger(__name__)
 
@@ -76,37 +77,34 @@ class DefaultRagService:
         lf_metadata: dict | None = None,
         lf_tags: list[str] | None = None,
     ) -> AsyncIterator[str | dict]:
-        """Yield response text tokens (str) as the LLM streams, then the result dict.
-
-        Streams via stream=True + response_format=json_object, extracts only the
-        'response' field value as clean text tokens, and yields the full parsed
-        result dict as the final item.
-
-        lf_* kwargs are forwarded to every OpenAI call so that langfuse.openai
-        wrapper links them to the correct session/trace in Langfuse.
-        """
-        # Build Langfuse per-call kwargs forwarded to every OpenAI create() call.
-        # Only kwargs explicitly listed in OpenAiArgsExtractor.__init__ are stripped
-        # before reaching the real OpenAI API — session_id/tags are NOT stripped in
-        # Langfuse 4.x (bug), so we embed them inside metadata instead.
-        lf: dict = {}
-        if lf_session_id:
-            lf["metadata"] = {
-                **(lf_metadata or {}),
-                "session_id": lf_session_id,
-                "tags": lf_tags or ["chat", "chatbot-sd", "SD"],
-            }
-
+        """Yield response text tokens (str) as the LLM streams, then the result dict."""
         messages = await self._build_messages(
-            query, history, conversation_status, error_email, lf=lf
+            query, history, conversation_status, error_email
         )
+
+        generation = None
+        if langfuse_service.enabled:
+            try:
+                from langfuse.types import TraceContext
+                trace_id = langfuse_service._client.create_trace_id(
+                    seed=lf_session_id,
+                )
+                generation = langfuse_service._client.start_observation(
+                    name=lf_trace_name,
+                    as_type="generation",
+                    trace_context=TraceContext(trace_id=trace_id),
+                    input=messages,
+                    metadata=lf_metadata,
+                )
+            except Exception as exc:
+                logger.warning("Langfuse generation start failed: %s", exc)
 
         raw_parts: list[str] = []
         in_response = False
         escape_next = False
         search_buf = ""
 
-        async for chunk in self._llm.stream_json(messages, name=lf_trace_name, **lf):
+        async for chunk in self._llm.stream_json(messages):
             raw_parts.append(chunk)
 
             if not in_response:
@@ -126,6 +124,14 @@ class DefaultRagService:
 
         raw = "".join(raw_parts)
         logger.debug("LLM stream accumulated: %r", raw)
+
+        if generation:
+            try:
+                generation.update(output=raw)
+                generation.end()
+            except Exception as exc:
+                logger.warning("Langfuse generation end failed: %s", exc)
+
         yield self._parse_structured(raw)
 
     # ------------------------------------------------------------------
@@ -138,7 +144,6 @@ class DefaultRagService:
         history: list[tuple[str, str]],
         conversation_status: int,
         error_email: int,
-        lf: dict | None = None,
     ) -> list[dict]:
         """Run the full RAG pipeline and return the assembled LLM message list."""
         standalone = await self._contextualize(query, history)

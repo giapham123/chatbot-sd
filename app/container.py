@@ -44,23 +44,14 @@ class Container:
 
 async def build_container(settings: Settings) -> Container:
     if settings.langfuse_enabled and settings.langfuse_secret_key and settings.langfuse_public_key:
-        import os
-        # Set env vars so langfuse.openai wrapper and decorators can pick them up
-        os.environ["LANGFUSE_SECRET_KEY"] = settings.langfuse_secret_key
-        os.environ["LANGFUSE_PUBLIC_KEY"] = settings.langfuse_public_key
-        os.environ["LANGFUSE_HOST"] = settings.langfuse_host
-        os.environ["LANGFUSE_TIMEOUT"] = str(settings.langfuse_timeout)
-        # Init singleton service with explicit params (mirrors ai-agent pattern)
         langfuse_service.init(
             secret_key=settings.langfuse_secret_key,
             public_key=settings.langfuse_public_key,
             host=settings.langfuse_host,
             timeout=settings.langfuse_timeout,
         )
-        from langfuse.openai import AsyncOpenAI
-    else:
-        from openai import AsyncOpenAI
 
+    from openai import AsyncOpenAI
     client = AsyncOpenAI(api_key=settings.openai_api_key)
 
     # Adapters
