@@ -1,7 +1,7 @@
 """Embed the knowledge base into Qdrant.
 
-Reads `data/knowledge_base.csv`, creates OpenAI embeddings for each document, and
-upserts them into a Qdrant collection (payload = doc metadata + text).
+By default reads `data/knowledge_base_full.md` (rich Q+synonyms+A format).
+Pass --source csv to use the legacy `data/knowledge_base.csv` instead.
 
 Run a Qdrant server first (local example):
     docker run -p 6333:6333 -p 6334:6334 -v qdrant_storage:/qdrant/storage qdrant/qdrant
@@ -17,8 +17,10 @@ Configure via env / .env:
     QDRANT_COLLECTION=chatbot_sd_kb                # optional (default)
 
 Run:
-    python scripts/embed_to_qdrant.py
-    python scripts/embed_to_qdrant.py --recreate   # drop & rebuild the collection
+    python scripts/embed_to_qdrant.py                        # embed from MD (default)
+    python scripts/embed_to_qdrant.py --source csv           # embed from CSV
+    python scripts/embed_to_qdrant.py --recreate             # drop & rebuild collection
+    python scripts/embed_to_qdrant.py --recreate --source csv
 """
 from __future__ import annotations
 
@@ -36,7 +38,10 @@ from qdrant_client.models import Distance, PointStruct, VectorParams
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from app.repositories.csv_repositories import CsvKnowledgeRepository  # noqa: E402
+from app.repositories.csv_repositories import (  # noqa: E402
+    CsvKnowledgeRepository,
+    MarkdownKnowledgeRepository,
+)
 
 load_dotenv()
 
@@ -44,7 +49,8 @@ EMBED_MODEL = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY") or None
 COLLECTION = os.getenv("QDRANT_COLLECTION", "chatbot_sd_kb")
-KB_PATH = ROOT / "data" / "knowledge_base.csv"
+MD_PATH = ROOT / "data" / "knowledge_base_full.md"
+CSV_PATH = ROOT / "data" / "knowledge_base.csv"
 BATCH = 100
 
 
@@ -60,19 +66,29 @@ def embed_batches(client: OpenAI, texts: list[str]) -> list[list[float]]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Embed knowledge_base.csv into Qdrant")
+    parser = argparse.ArgumentParser(description="Embed knowledge base into Qdrant")
     parser.add_argument("--recreate", action="store_true",
                         help="Drop the collection first, then rebuild it")
+    parser.add_argument("--source", choices=["md", "csv"], default="md",
+                        help="Source file: 'md' = knowledge_base_full.md (default), "
+                             "'csv' = knowledge_base.csv")
     args = parser.parse_args()
 
     if not os.getenv("OPENAI_API_KEY"):
         raise SystemExit("OPENAI_API_KEY is not set (put it in .env).")
 
     # 1) Load knowledge base rows.
-    docs = CsvKnowledgeRepository(KB_PATH).all()
+    if args.source == "md":
+        if not MD_PATH.exists():
+            raise SystemExit(f"MD file not found: {MD_PATH}\nRun with --source csv or create the file first.")
+        docs = MarkdownKnowledgeRepository(MD_PATH).all()
+        print(f"Loaded {len(docs)} KB documents from {MD_PATH.name}")
+    else:
+        docs = CsvKnowledgeRepository(CSV_PATH).all()
+        print(f"Loaded {len(docs)} KB documents from {CSV_PATH.name}")
+
     if not docs:
-        raise SystemExit(f"No documents found in {KB_PATH}")
-    print(f"Loaded {len(docs)} KB documents from {KB_PATH.name}")
+        raise SystemExit("No documents found — check your source file.")
 
     # 2) Embed every document (question + answer).
     openai_client = OpenAI()

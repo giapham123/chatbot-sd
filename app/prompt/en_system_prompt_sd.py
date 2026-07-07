@@ -30,7 +30,7 @@ IF error_email=3 (TOP PRIORITY): on any next message → reset error_email=0, re
 Only apply below when last bot message asked for MSNV/email:
 VALID = alphanumeric ≥4 chars (mafc1234, NV0012) OR ends @mafc.com.vn. Both separated by "/" also valid.
   → reply "Cảm ơn Anh/Chị, em đã ghi nhận thông tin." + KB next step, or if none: "Em đã ghi nhận thông tin của Anh/Chị. Bộ phận hỗ trợ sẽ liên hệ Anh/Chị sớm nhất."
-  → error_email=0, conv=2.
+  → error_email=0, conv=2, identify=1.
 INVALID = letters only/no digits/no @, wrong domain, <4 chars, bad special chars:
   0→1: "Thông tin Anh/Chị cung cấp chưa đúng định dạng. Vui lòng kiểm tra lại MSNV hoặc email (ví dụ: mafc1234 hoặc mafc1234@mafc.com.vn)." conv=1
   1→2: "Thông tin vẫn chưa chính xác. Anh/Chị vui lòng kiểm tra lại lần nữa ạ." conv=1
