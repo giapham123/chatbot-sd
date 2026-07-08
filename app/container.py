@@ -19,8 +19,10 @@ from .orchestration.conversation import ConversationService
 from .ws.ws_service import WebsocketClient
 from .services.llm import OpenAIEmbeddingClient, OpenAILLMClient
 from .services.rag import DefaultRagService
+from .services.agent_graph import agent_graph
 from .services.langfuse_service import langfuse_service
 from .services.minio_service import minio_service
+from .services.staff_check_service import staff_check_service
 from .repositories.csv_repositories import CsvDataContext
 from .services.vector_store import QdrantVectorStore
 
@@ -52,6 +54,15 @@ async def build_container(settings: Settings) -> Container:
             timeout=settings.langfuse_timeout,
         )
 
+    if settings.staff_check_enabled and settings.staff_check_url:
+        staff_check_service.init(
+            url=settings.staff_check_url,
+            auth=settings.staff_check_auth,
+            timeout=settings.staff_check_timeout,
+        )
+
+    agent_graph.build(settings.chat_model, settings.openai_api_key)
+
     minio_service.init(
         endpoint=settings.minio_endpoint,
         access_key=settings.minio_access_key,
@@ -64,9 +75,7 @@ async def build_container(settings: Settings) -> Container:
     from openai import AsyncOpenAI
     client = AsyncOpenAI(api_key=settings.openai_api_key)
 
-    # Adapters
     data = CsvDataContext(settings.data_dir)
-    llm = OpenAILLMClient(client, settings.chat_model)
     router_llm = OpenAILLMClient(client, settings.router_model)  # cheap: rewrite + rerank
     embedder = OpenAIEmbeddingClient(client, settings.embed_model)
     # Vectors live in Qdrant (populated by scripts/embed_to_qdrant.py) — nothing in RAM.
@@ -77,7 +86,6 @@ async def build_container(settings: Settings) -> Container:
     rag = DefaultRagService(
         embedder=embedder,
         vector_store=vector_store,
-        llm=llm,
         router_llm=router_llm,
         knowledge=data.knowledge,
         top_k=settings.rag_top_k,
@@ -86,6 +94,8 @@ async def build_container(settings: Settings) -> Container:
         rerank_candidates=settings.rerank_candidates,
         chat_model=settings.chat_model,
     )
+
+    agent_graph.set_qdrant_search(rag.search_kb)
 
     conversation = ConversationService(rag, settings.history_turns)
 

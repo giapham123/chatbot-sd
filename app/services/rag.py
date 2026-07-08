@@ -16,6 +16,7 @@ from typing import AsyncIterator
 from openai import APIConnectionError, APITimeoutError
 from ..domain.interfaces import EmbeddingClient, KnowledgeRepository, LLMClient, VectorStore
 from ..prompt.en_system_prompt_sd import AGENT_SYSTEM_PROMPT_SD, RERANK_PROMPT, REWRITE_PROMPT
+from .agent_graph import agent_graph
 from .langfuse_service import langfuse_service
 
 logger = logging.getLogger(__name__)
@@ -47,7 +48,6 @@ class DefaultRagService:
         self,
         embedder: EmbeddingClient,
         vector_store: VectorStore,
-        llm: LLMClient,
         router_llm: LLMClient,
         knowledge: KnowledgeRepository,
         top_k: int,
@@ -58,7 +58,6 @@ class DefaultRagService:
     ) -> None:
         self._embedder = embedder
         self._store = vector_store
-        self._llm = llm
         self._router = router_llm
         self._docs = {d.doc_id: d for d in knowledge.all()}
         self._top_k = top_k
@@ -111,7 +110,7 @@ class DefaultRagService:
         search_buf = ""
         usage_info: dict | None = None
 
-        async for chunk in self._llm.stream_json(messages):
+        async for chunk in agent_graph.stream_answer(messages):
             if isinstance(chunk, dict):
                 usage_info = chunk
                 continue
@@ -167,21 +166,9 @@ class DefaultRagService:
         error_email: int,
         image_b64: list[tuple[str, str]] | None = None,
     ) -> list[dict]:
-        """Run the full RAG pipeline and return the assembled LLM message list."""
+        """Assemble the LLM message list — KB search is handled by the LangGraph qdrant node."""
+        # Rewrite follow-up questions into standalone queries for the qdrant node
         standalone = await self._contextualize(query, history)
-
-        context_texts: list[str] = []
-        vectors = await self._embedder.embed([standalone])
-        if vectors:
-            hits = await self._store.search(vectors[0], self._rerank_candidates)
-            candidates = [
-                self._docs[doc_id]
-                for doc_id, score in hits
-                if score >= self._min_score and doc_id in self._docs
-            ]
-            if candidates:
-                ranked = await self._rerank(standalone, candidates)
-                context_texts = [d.as_text() for d in ranked[: self._top_k]]
 
         last_bot_msg = ""
         for role, text in reversed(history):
@@ -198,8 +185,6 @@ class DefaultRagService:
         for role, text in history:
             messages.append({"role": "assistant" if role == "bot" else "user", "content": text})
 
-        joined = "\n\n".join(context_texts) if context_texts else "(không có ngữ cảnh)"
-
         last_bot_hint = (
             f"\n\n⚠️ TIN NHẮN BOT GẦN NHẤT (KHÔNG được lặp lại): \"{last_bot_msg}\""
             if last_bot_msg else ""
@@ -207,17 +192,17 @@ class DefaultRagService:
 
         history_summary = ""
         if history:
-            lines = []
-            for role, text in history:
-                label = "Khách" if role == "user" else "Bot"
-                lines.append(f"{label}: {text}")
+            lines = [
+                f"{'Khách' if role == 'user' else 'Bot'}: {text}"
+                for role, text in history
+            ]
             history_summary = "\n\nTÓM TẮT LỊCH SỬ HỘI THOẠI:\n" + "\n".join(lines)
 
+        # Use the rewritten standalone query so the qdrant node gets the right search term
         text = (
-            f"NGỮ CẢNH KB:\n{joined}"
             f"{history_summary}"
             f"{last_bot_hint}"
-            f"\n\nCÂU HỎI HIỆN TẠI: {query}"
+            f"\n\nCÂU HỎI HIỆN TẠI: {standalone}"
         )
 
         if image_b64:
@@ -232,6 +217,7 @@ class DefaultRagService:
             messages.append({"role": "user", "content": text})
 
         return messages
+
 
     def _parse_structured(self, raw: str) -> dict:
         """Extract {response, conversation_status, identify, error_email} from LLM output."""
@@ -254,6 +240,22 @@ class DefaultRagService:
             "identify": 2,
             "error_email": 0,
         }
+
+    async def search_kb(self, query: str) -> str:
+        """Embed → vector search → rerank → formatted text. Called by the LangGraph qdrant node."""
+        vectors = await self._embedder.embed([query])
+        if not vectors:
+            return "(không có kết quả)"
+        hits = await self._store.search(vectors[0], self._rerank_candidates)
+        candidates = [
+            self._docs[doc_id]
+            for doc_id, score in hits
+            if score >= self._min_score and doc_id in self._docs
+        ]
+        if not candidates:
+            return "(không có kết quả phù hợp trong KB)"
+        ranked = await self._rerank(query, candidates)
+        return "\n\n".join(d.as_text() for d in ranked[: self._top_k])
 
     async def _contextualize(self, query: str, history: list[tuple[str, str]]) -> str:
         if not history:

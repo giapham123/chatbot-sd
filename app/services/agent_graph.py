@@ -1,0 +1,482 @@
+"""LangGraph ReAct agent with prompt-based entry router and explicit three-node graph.
+
+Graph topology
+──────────────
+  decide_tool ──[check_staff]──> check_staff ──> agent ──> END
+              ──[qdrant]──────> qdrant      ──> agent ──> END
+              ──[agent]───────> agent                ──> END
+
+Phase 1 — graph.ainvoke():
+  decide_tool (entry) uses a cheap LLM call + ROUTER_PROMPT to classify the question
+  and route directly to the right first node, skipping unnecessary agent turns.
+  check_staff / qdrant nodes execute their work and loop back to agent for final routing.
+  agent exits to END once it has no more tool calls.
+
+Phase 2 — stream_json():
+  The agent's draft AIMessage is dropped; stream_json is called on the accumulated
+  messages with response_format=json_object so the LLM always returns parseable JSON.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import re
+import uuid
+from typing import Annotated, AsyncIterator, Callable, Coroutine
+
+from langchain_core.messages import (
+    AIMessage, AnyMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage,
+)
+from langchain_core.tools import tool as lc_tool
+from langchain_openai import ChatOpenAI
+from langgraph.graph import END, StateGraph
+from langgraph.graph.message import add_messages
+from openai import AsyncOpenAI
+from typing_extensions import TypedDict
+
+from .llm import OpenAILLMClient
+from .staff_check_service import staff_check_service
+from ..prompt.en_system_prompt_sd import ROUTER_PROMPT
+
+logger = logging.getLogger(__name__)
+
+_MAX_AGENT_TURNS = 6
+
+_EMAIL_RE = re.compile(r'\b[\w.+-]+@mafc\.com\.vn\b', re.IGNORECASE)
+_MSNV_RE  = re.compile(r'\b[A-Za-z]{2,}[0-9]{2,}[A-Za-z0-9]*\b')
+
+
+def _extract_staff_ids(text: str) -> tuple[str, str]:
+    """Return (employee_id, email_id) from user message text."""
+    email_match = _EMAIL_RE.search(text)
+    if email_match:
+        email = email_match.group(0)
+        return email.split("@")[0], email
+    msnv_match = _MSNV_RE.search(text)
+    if msnv_match:
+        return msnv_match.group(0), ""
+    return "", ""
+
+
+# ---------------------------------------------------------------------------
+# Tools  (each maps to a graph node via _TOOL_TO_NODE)
+# ---------------------------------------------------------------------------
+
+@lc_tool
+async def check_staff_active(employee_id: str, email_id: str) -> str:
+    """Xác minh nhân viên MAFC có tồn tại và đang hoạt động không.
+
+    Gọi khi người dùng cung cấp MSNV (ví dụ MAFCOS4430) hoặc
+    email công ty (ví dụ MAFCOS4430@mafc.com.vn) để đăng ký hỗ trợ.
+
+    Args:
+        employee_id: Mã số nhân viên (MSNV), ví dụ "MAFCOS4430"
+        email_id: Email công ty, ví dụ "MAFCOS4430@mafc.com.vn"
+    """
+    return ""   # execution handled by _call_check_staff node
+
+
+@lc_tool
+async def search_knowledge_base(query: str) -> str:
+    """Tìm kiếm thêm thông tin trong KB của MAFC khi ngữ cảnh hiện tại không đủ.
+
+    Gọi khi câu hỏi cần thêm chi tiết kỹ thuật hoặc hướng dẫn cụ thể từ KB.
+
+    Args:
+        query: Câu truy vấn cụ thể cần tìm kiếm thêm trong KB.
+    """
+    return ""   # result injected by the qdrant node
+
+
+TOOLS = [check_staff_active, search_knowledge_base]
+_TOOL_TO_NODE = {
+    check_staff_active.name:    "check_staff",
+    search_knowledge_base.name: "qdrant",
+}
+
+
+# ---------------------------------------------------------------------------
+# Graph state
+# ---------------------------------------------------------------------------
+
+class AgentState(TypedDict):
+    messages:  Annotated[list[AnyMessage], add_messages]
+    next_node: str   # written by decide_tool, read by _route_from_decide
+
+
+# ---------------------------------------------------------------------------
+# Message converters
+# ---------------------------------------------------------------------------
+
+def _to_lc_messages(openai_messages: list[dict]) -> list[BaseMessage]:
+    """OpenAI-format dicts → LangChain BaseMessage list."""
+    out: list[BaseMessage] = []
+    for m in openai_messages:
+        role = m.get("role", "")
+        content = m.get("content") or ""
+        if role == "system":
+            out.append(SystemMessage(content=content if isinstance(content, str) else ""))
+        elif role == "user":
+            out.append(HumanMessage(content=content))
+        elif role == "assistant":
+            out.append(AIMessage(content=str(content)))
+    return out
+
+
+def _to_openai_messages(lc_messages: list[BaseMessage]) -> list[dict]:
+    """LangChain BaseMessage list → OpenAI-format dicts (preserves tool call history)."""
+    out: list[dict] = []
+    for m in lc_messages:
+        if isinstance(m, SystemMessage):
+            out.append({"role": "system", "content": m.content})
+        elif isinstance(m, HumanMessage):
+            out.append({"role": "user", "content": m.content})
+        elif isinstance(m, AIMessage):
+            msg: dict = {"role": "assistant", "content": m.content or ""}
+            if m.tool_calls:
+                msg["tool_calls"] = [
+                    {
+                        "id": tc["id"],
+                        "type": "function",
+                        "function": {
+                            "name": tc["name"],
+                            "arguments": json.dumps(tc["args"]),
+                        },
+                    }
+                    for tc in m.tool_calls
+                ]
+            out.append(msg)
+        elif isinstance(m, ToolMessage):
+            out.append({
+                "role": "tool",
+                "content": str(m.content),
+                "tool_call_id": m.tool_call_id,
+            })
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Agent
+# ---------------------------------------------------------------------------
+
+QdrantSearchFn = Callable[[str], Coroutine[None, None, str]]
+
+
+class AgentGraph:
+    def __init__(self) -> None:
+        self._llm_client: OpenAILLMClient | None = None
+        self._llm_with_tools = None
+        self._graph = None
+        self._qdrant_search: QdrantSearchFn | None = None
+
+    @property
+    def enabled(self) -> bool:
+        return self._llm_client is not None
+
+    def set_qdrant_search(self, fn: QdrantSearchFn) -> None:
+        self._qdrant_search = fn
+
+    def build(
+        self,
+        chat_model: str,
+        api_key: str,
+        qdrant_search_fn: QdrantSearchFn | None = None,
+    ) -> None:
+        self._llm_client = OpenAILLMClient(AsyncOpenAI(api_key=api_key), chat_model)
+        self._qdrant_search = qdrant_search_fn
+
+        llm = ChatOpenAI(
+            model=chat_model,
+            temperature=0,
+            openai_api_key=api_key,
+            model_kwargs={"parallel_tool_calls": False},
+        )
+        self._llm_with_tools = llm.bind_tools(TOOLS)
+
+        graph = StateGraph(AgentState)
+        graph.add_node("decide_tool", self._decide_tool)
+        graph.add_node("agent",       self._call_agent)
+        graph.add_node("check_staff", self._call_check_staff)
+        graph.add_node("qdrant",      self._call_qdrant)
+
+        graph.set_entry_point("decide_tool")
+
+        graph.add_conditional_edges(
+            "decide_tool",
+            self._route_from_decide,
+            {
+                "check_staff": "check_staff",
+                "qdrant":      "qdrant",
+                "agent":       "agent",
+            },
+        )
+
+        graph.add_conditional_edges(
+            "agent",
+            self._route,
+            {
+                "check_staff": "check_staff",
+                "qdrant":      "qdrant",
+                END:           END,
+            },
+        )
+
+        graph.add_edge("check_staff", "agent")
+        graph.add_edge("qdrant",      "agent")
+
+        self._graph = graph.compile()
+        logger.info(
+            "AgentGraph built — model=%s tools=[%s]",
+            chat_model, ", ".join(t.name for t in TOOLS),
+        )
+
+    # ------------------------------------------------------------------
+    # Entry node — decide_tool
+    # ------------------------------------------------------------------
+
+    async def _decide_tool(self, state: AgentState) -> dict:
+        """Classify the current question only — history is intentionally excluded.
+
+        When routing to check_staff:
+          - Extracts MSNV / email from the current message
+          - Emits a synthetic AIMessage(tool_calls=[check_staff_active(employee_id, email_id)])
+            so _call_check_staff always sees a proper tool_calls entry.
+
+        When routing to qdrant or agent:
+          - No messages added; the node just sets next_node.
+        """
+        # _decide_tool is the graph entry point — the last message is always the current question
+        last = state["messages"][-1] if state["messages"] else None
+        if not isinstance(last, HumanMessage):
+            return {"next_node": "agent"}
+
+        # Extract raw text (handles multimodal list content)
+        raw_content = last.content
+        if isinstance(raw_content, list):
+            raw_text = " ".join(
+                p.get("text", "")
+                for p in raw_content
+                if isinstance(p, dict) and p.get("type") == "text"
+            )
+        else:
+            raw_text = str(raw_content)
+
+        # rag.py prefixes KB context + history before the actual question.
+        # Strip everything before the marker so the router sees only the bare question.
+        _QUESTION_MARKER = "CÂU HỎI HIỆN TẠI:"
+        question = raw_text.split(_QUESTION_MARKER, 1)[-1].strip()
+
+        routing_messages = [
+            {"role": "system", "content": ROUTER_PROMPT},
+            {"role": "user",   "content": str(question)},
+        ]
+
+        raw = (await self._llm_client.complete(routing_messages)).strip()
+
+        # Parse structured JSON response from ROUTER_PROMPT
+        employee_id = ""
+        email_id    = ""
+        try:
+            parsed      = json.loads(raw)
+            next_node   = str(parsed.get("route", "agent")).strip().lower()
+            employee_id = str(parsed.get("employee_id") or "").strip()
+            email_id    = str(parsed.get("email_id") or "").strip()
+        except (json.JSONDecodeError, ValueError):
+            # Fallback: keyword position search in raw text
+            lower = raw.lower()
+            VALID = {"check_staff", "qdrant", "agent"}
+            positions = {kw: lower.find(kw) for kw in VALID if kw in lower}
+            next_node = min(positions, key=positions.get) if positions else "agent"
+            if next_node == "check_staff":
+                employee_id, email_id = _extract_staff_ids(str(question))
+
+        if next_node not in {"check_staff", "qdrant", "agent"}:
+            next_node = "agent"
+
+        result: dict = {"next_node": next_node}
+
+        if next_node == "check_staff":
+            # Fallback to regex if LLM returned empty ids
+            if not employee_id and not email_id:
+                employee_id, email_id = _extract_staff_ids(str(question))
+            tc_id = f"call_{uuid.uuid4().hex[:8]}"
+            result["messages"] = [
+                AIMessage(
+                    content="",
+                    tool_calls=[{
+                        "id":   tc_id,
+                        "name": check_staff_active.name,
+                        "args": {"employee_id": employee_id, "email_id": email_id},
+                    }],
+                )
+            ]
+            logger.info(
+                "_decide_tool: '%s...' → check_staff employee_id=%r email_id=%r",
+                str(question)[:60], employee_id, email_id,
+            )
+        else:
+            logger.info("_decide_tool: '%s...' → %s", str(question)[:60], next_node)
+
+        return result
+
+    def _route_from_decide(self, state: AgentState) -> str:
+        return state.get("next_node", "agent")
+
+    # ------------------------------------------------------------------
+    # Graph nodes
+    # ------------------------------------------------------------------
+
+    async def _call_agent(self, state: AgentState) -> dict:
+        response = await self._llm_with_tools.ainvoke(state["messages"])
+        agent_turns = sum(1 for m in state["messages"] if isinstance(m, AIMessage))
+        logger.debug(
+            "_call_agent: turn=%d tool_calls=%s",
+            agent_turns,
+            [tc["name"] for tc in getattr(response, "tool_calls", [])] or "none",
+        )
+        return {"messages": [response]}
+
+    async def _call_check_staff(self, state: AgentState) -> dict:
+        """Execute staff verification using tool_call args from the last AIMessage.
+
+        The tool call is always present — either emitted by _decide_tool (direct route)
+        or by the agent node. Calls staff_check_service.verify() directly.
+        """
+        last = state["messages"][-1]
+        tool_calls = getattr(last, "tool_calls", None)
+        if not tool_calls:
+            logger.warning("_call_check_staff: no tool_calls on last message, skipping")
+            return {"messages": []}
+
+        tc = next((tc for tc in tool_calls if tc["name"] == check_staff_active.name), None)
+        if not tc:
+            return {"messages": []}
+
+        employee_id = tc["args"].get("employee_id", "")
+        email_id    = tc["args"].get("email_id", "")
+
+        try:
+            active = await staff_check_service.verify(employee_id, email_id)
+        except Exception as exc:
+            active = None
+            logger.error("_call_check_staff: verify() failed: %s", exc)
+
+        if active is True:
+            content = (
+                f"ACTIVE: Nhân viên {employee_id} tồn tại và đang hoạt động. "
+                "Ghi nhận thông tin và tiến hành hỗ trợ."
+            )
+        elif active is False:
+            content = (
+                f"NOT_FOUND: Nhân viên {employee_id} không tìm thấy hoặc đã nghỉ việc. "
+                "Yêu cầu người dùng kiểm tra lại."
+            )
+        else:
+            content = (
+                f"UNKNOWN: Không thể xác minh {employee_id} (lỗi kết nối). "
+                "Xử lý như ACTIVE (fail open)."
+            )
+
+        logger.info("_call_check_staff: %s → %r", employee_id, content[:80])
+        return {"messages": [ToolMessage(content=content, tool_call_id=tc["id"])]}
+
+    async def _call_qdrant(self, state: AgentState) -> dict:
+        """Execute KB search using tool_call args from the last AIMessage."""
+        last = state["messages"][-1]
+        results: list = []
+
+        tool_calls = getattr(last, "tool_calls", None)
+        if not tool_calls:
+            # Direct route from decide_tool — synthesise tool call + result pair
+            last_human = next(
+                (m for m in reversed(state["messages"]) if isinstance(m, HumanMessage)), None
+            )
+            query = str(last_human.content if last_human else "")
+            tc_id = f"call_{uuid.uuid4().hex[:8]}"
+            results.append(AIMessage(
+                content="",
+                tool_calls=[{
+                    "id":   tc_id,
+                    "name": search_knowledge_base.name,
+                    "args": {"query": query},
+                }],
+            ))
+            content = await self._run_qdrant_search(query)
+            results.append(ToolMessage(content=content, tool_call_id=tc_id))
+            logger.info("_call_qdrant (direct): query=%r result_len=%d", query[:60], len(content))
+        else:
+            for tc in tool_calls:
+                if tc["name"] == search_knowledge_base.name:
+                    query = tc["args"].get("query", "")
+                    content = await self._run_qdrant_search(query)
+                    results.append(ToolMessage(content=content, tool_call_id=tc["id"]))
+                    logger.info("_call_qdrant: query=%r result_len=%d", query[:60], len(content))
+
+        return {"messages": results}
+
+    async def _run_qdrant_search(self, query: str) -> str:
+        if self._qdrant_search:
+            try:
+                return await self._qdrant_search(query)
+            except Exception as exc:
+                logger.error("_call_qdrant search failed: %s", exc)
+                return f"(lỗi tìm kiếm KB: {exc})"
+        return "(không có kết quả bổ sung — sử dụng ngữ cảnh hiện có)"
+
+    # ------------------------------------------------------------------
+    # Routing
+    # ------------------------------------------------------------------
+
+    def _route(self, state: AgentState) -> str:
+        last = state["messages"][-1]
+        tool_calls = getattr(last, "tool_calls", None)
+        if not tool_calls:
+            return END
+
+        agent_turns = sum(1 for m in state["messages"] if isinstance(m, AIMessage))
+        if agent_turns >= _MAX_AGENT_TURNS:
+            logger.warning("_route: max agent turns (%d) reached, forcing END", _MAX_AGENT_TURNS)
+            return END
+
+        return _TOOL_TO_NODE.get(tool_calls[0]["name"], END)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    async def stream_answer(self, openai_messages: list[dict]) -> AsyncIterator[str | dict]:
+        """Phase 1: graph.ainvoke() collects tool results. Phase 2: stream_json for response."""
+        if not self.enabled:
+            raise RuntimeError("AgentGraph not built — call agent_graph.build() in container.py")
+
+        logger.debug("stream_answer: start, messages=%d", len(openai_messages))
+
+        lc_messages = _to_lc_messages(openai_messages)
+        final_state = await self._graph.ainvoke(
+            {"messages": lc_messages, "next_node": "agent"}
+        )
+        all_messages: list[BaseMessage] = final_state["messages"]
+
+        # Drop the agent's last draft AIMessage (no response_format → plain text).
+        messages_for_stream = all_messages
+        if (
+            len(all_messages) > len(lc_messages)
+            and isinstance(all_messages[-1], AIMessage)
+            and not getattr(all_messages[-1], "tool_calls", None)
+        ):
+            messages_for_stream = all_messages[:-1]
+
+        logger.debug(
+            "stream_answer: graph done (%d→%d messages), next_node=%s, streaming",
+            len(lc_messages), len(messages_for_stream),
+            final_state.get("next_node", "?"),
+        )
+
+        ready_openai = _to_openai_messages(messages_for_stream)
+        async for chunk in self._llm_client.stream_json(ready_openai):
+            yield chunk
+
+        logger.debug("stream_answer: complete")
+
+
+agent_graph = AgentGraph()

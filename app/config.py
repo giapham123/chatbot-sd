@@ -50,6 +50,11 @@ class Settings:
     minio_secure: bool
     minio_public_base_url: str
     minio_bucket: str
+    # Staff active-status verification
+    staff_check_enabled: bool
+    staff_check_url: str
+    staff_check_auth: str   # base64 "user:pass" (the part after "Basic ")
+    staff_check_timeout: float
 
     @staticmethod
     def load() -> "Settings":
@@ -85,4 +90,8 @@ class Settings:
             minio_secure=os.getenv("MINIO_SECURE", "false").lower() == "true",
             minio_public_base_url=os.getenv("MINIO_PUBLIC_BASE_URL", ""),
             minio_bucket=os.getenv("MINIO_BUCKET_NAME", "chatbotmafc"),
+            staff_check_enabled=os.getenv("STAFF_CHECK_ENABLED", "false").lower() == "true",
+            staff_check_url=os.getenv("STAFF_CHECK_URL", ""),
+            staff_check_auth=os.getenv("STAFF_CHECK_AUTH", ""),
+            staff_check_timeout=float(os.getenv("STAFF_CHECK_TIMEOUT", "5")),
         )

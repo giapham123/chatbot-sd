@@ -151,7 +151,7 @@ async def chat(req: ChatSDRequest) -> StreamingResponse:
                 agent_id=req.agent_id,
                 platform=platform,
                 conversation_status=req.conversation_status,
-                error=req.error,
+                error=req.error,        # error_email extracted inside stream()
                 image_b64=image_b64,
             ):
                 if event.event == "output" and image_detection:

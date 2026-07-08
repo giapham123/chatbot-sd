@@ -1,11 +1,13 @@
-"""ConversationService — orchestrates one SD turn with real LLM token streaming.
+"""ConversationService — orchestrates one SD turn with LangGraph token streaming.
 
-Calls the RAG service directly (bypassing LangGraph) for the streaming path.
-The graph is kept for non-streaming callers (e.g. the /chat SSE endpoint).
+Single call to stream() feeds all three transports without re-running the LLM:
+  • HTTP SSE  — each StreamEvent yielded is formatted as an SSE frame in main.py
+  • WebSocket — handler.py sends WS "processing" per token, "done" at end
+  • Kafka     — worker.py publishes the final output dict to the output topic
 
-Chat history is kept client-side and sent per request as LangChain format
-([{"type": "human"|"ai", "content": "..."}]); the Kafka layer converts it to
-(role, text) tuples before calling stream().
+error_email is extracted automatically from the error dict so all callers
+(HTTP, Kafka handler) pass the same single `error` argument and get consistent
+LangGraph tool-calling behaviour.
 """
 from __future__ import annotations
 
@@ -36,7 +38,6 @@ class ConversationService:
         agent_id: str | None = None,
         platform: str = "WEB",
         conversation_status: int = 0,
-        error_email: int = 0,
         error: dict | None = None,
         image_b64: list[tuple[str, str]] | None = None,
         lf_session_id: str | None = None,
@@ -45,6 +46,15 @@ class ConversationService:
         lf_tags: list[str] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         history = (history or [])[-self._history_turns:]
+
+        # Extract error_email from the round-tripped error dict.
+        # Centralising here means HTTP, WS, and Kafka callers all behave the same.
+        error_email = 0
+        if isinstance(error, dict):
+            try:
+                error_email = int(error.get("error_email", 0))
+            except (TypeError, ValueError):
+                pass
 
         answer_parts: list[str] = []
         result: dict = {}

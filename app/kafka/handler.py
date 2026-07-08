@@ -17,17 +17,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _extract_error_email(data: dict) -> int:
-    """Read error_email from the error dict (round-tripped from previous response)."""
-    error = data.get("error")
-    if isinstance(error, dict):
-        try:
-            return int(error.get("error_email", 0))
-        except (TypeError, ValueError):
-            pass
-    return 0
-
-
 async def handle_chat_sd(
     data: dict,
     conversation: ConversationService,
@@ -41,7 +30,6 @@ async def handle_chat_sd(
     platform            = data.get("platform") or "WEB"
     history             = lc_to_tuples(data.get("chat_history"))
     conversation_status = int(data.get("conversation_status") or 0)
-    error_email         = _extract_error_email(data)
     error               = data.get("error") if isinstance(data.get("error"), dict) else {}
     image_url       = data.get("image_url") or []
     image_detection = minio_service.get_image_urls(image_url, platform)
@@ -70,7 +58,6 @@ async def handle_chat_sd(
             agent_id=agent_id,
             platform=platform,
             conversation_status=conversation_status,
-            error_email=error_email,
             error=error,
             image_b64=image_b64 or None,
             lf_session_id=channel_id,
@@ -87,9 +74,11 @@ async def handle_chat_sd(
         if ws_client:
             await ws_client.send(agent_id, channel_id, message_id, "error", str(exc))
     finally:
-        # Flush traces after each request — same pattern as ai-agent
         if langfuse_service.enabled:
-            langfuse_service.flush()
+            try:
+                langfuse_service.flush()
+            except Exception as exc:
+                logger.warning("Langfuse flush failed: %s", exc)
 
     if output is None:
         output = {
@@ -98,7 +87,7 @@ async def handle_chat_sd(
             "tool_messages": None, "recursion_count": 0, "last_tool_name": "",
             "chat_history": None, "platform": platform,
             "conversation_status": 0, "identify": 2,
-            "error": {"error_email": error_email}, "extra": None,
+            "error": {**error, "error_email": error.get("error_email", 0)}, "extra": None,
             "image_detection": image_detection or None,
         }
     else:
