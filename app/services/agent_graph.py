@@ -36,7 +36,7 @@ from typing_extensions import TypedDict
 
 from .llm import OpenAILLMClient
 from .staff_check_service import staff_check_service
-from ..prompt.en_system_prompt_sd import ROUTER_PROMPT
+from ..prompt.en_system_prompt_sd import END_CHAT_PROMPT, ROUTER_PROMPT
 
 logger = logging.getLogger(__name__)
 
@@ -100,8 +100,9 @@ _TOOL_TO_NODE = {
 # ---------------------------------------------------------------------------
 
 class AgentState(TypedDict):
-    messages:  Annotated[list[AnyMessage], add_messages]
-    next_node: str   # written by decide_tool, read by _route_from_decide
+    messages:            Annotated[list[AnyMessage], add_messages]
+    next_node:           str   # written by decide_tool, read by _route_from_decide
+    conversation_status: int  # 1=ongoing, 5=end — written by _call_agent
 
 
 # ---------------------------------------------------------------------------
@@ -334,7 +335,38 @@ class AgentGraph:
             agent_turns,
             [tc["name"] for tc in getattr(response, "tool_calls", [])] or "none",
         )
-        return {"messages": [response]}
+
+        # Evaluate whether the conversation should end based on accumulated history
+        conversation_status = await self._evaluate_end_chat(state["messages"])
+
+        return {"messages": [response], "conversation_status": conversation_status}
+
+    async def _evaluate_end_chat(self, messages: list[AnyMessage]) -> int:
+        """Return 2 if the conversation should end, 1 if it should continue."""
+        history_lines: list[str] = []
+        for m in messages:
+            if isinstance(m, HumanMessage):
+                history_lines.append(f"User: {str(m.content)[:300]}")
+            elif isinstance(m, AIMessage) and not getattr(m, "tool_calls", None):
+                history_lines.append(f"Bot: {str(m.content)[:300]}")
+            elif isinstance(m, ToolMessage):
+                history_lines.append(f"Tool result: {str(m.content)[:200]}")
+
+        if not history_lines:
+            return 1
+
+        eval_messages = [
+            {"role": "system", "content": END_CHAT_PROMPT},
+            {"role": "user",   "content": "\n".join(history_lines)},
+        ]
+        try:
+            raw = (await self._llm_client.complete(eval_messages)).strip().lower()
+            result = 5 if "end" in raw else 1
+            logger.debug("_evaluate_end_chat: %r → conversation_status=%d", raw, result)
+            return result
+        except Exception as exc:
+            logger.warning("_evaluate_end_chat failed: %s", exc)
+            return 1
 
     async def _call_check_staff(self, state: AgentState) -> dict:
         """Execute staff verification using tool_call args from the last AIMessage.
@@ -453,7 +485,7 @@ class AgentGraph:
 
         lc_messages = _to_lc_messages(openai_messages)
         final_state = await self._graph.ainvoke(
-            {"messages": lc_messages, "next_node": "agent"}
+            {"messages": lc_messages, "next_node": "agent", "conversation_status": 1}
         )
         all_messages: list[BaseMessage] = final_state["messages"]
 
@@ -466,13 +498,24 @@ class AgentGraph:
         ):
             messages_for_stream = all_messages[:-1]
 
+        conv_status = final_state.get("conversation_status", 1)
         logger.debug(
-            "stream_answer: graph done (%d→%d messages), next_node=%s, streaming",
+            "stream_answer: graph done (%d→%d messages), next_node=%s, conv_status=%d, streaming",
             len(lc_messages), len(messages_for_stream),
             final_state.get("next_node", "?"),
+            conv_status,
         )
 
-        ready_openai = _to_openai_messages(messages_for_stream)
+        ready_openai = list(_to_openai_messages(messages_for_stream))
+        if conv_status == 5:
+            ready_openai.append({
+                "role": "system",
+                "content": (
+                    "[EVALUATION] Cuộc trò chuyện đã hoàn tất. "
+                    "Đặt conversation_status=5 trong JSON output."
+                ),
+            })
+
         async for chunk in self._llm_client.stream_json(ready_openai):
             yield chunk
 

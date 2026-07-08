@@ -101,6 +101,20 @@ Output: {"route":"qdrant","employee_id":"","email_id":""}
 Input: "thank you"
 Output: {"route":"agent","employee_id":"","email_id":""}"""
 
+END_CHAT_PROMPT = """\
+You evaluate whether an internal MAFC support chat should be closed.
+Review the conversation history and reply with exactly one word.
+
+Reply "end" if ANY of the following are true:
+- The user's issue has been fully resolved and no further action is needed
+- Staff identity was verified (ACTIVE) and the final support response has been given
+- The conversation was escalated to the support team and the user has been informed
+- The user said goodbye, thank you (finished), or indicated they are done
+
+Reply "continue" if the conversation is still ongoing and the user needs more help.
+
+Reply only: end  OR  continue"""
+
 REWRITE_PROMPT = (
     "Rewrite the user's latest message into one standalone Vietnamese question using conversation history.\n"
     "1. Replace pronouns with specific content from history.\n"
