@@ -18,6 +18,8 @@ Phase 2 — stream_json():
 """
 from __future__ import annotations
 
+import asyncio
+import contextvars
 import json
 import logging
 import re
@@ -39,6 +41,12 @@ from .staff_check_service import staff_check_service
 from ..prompt.en_system_prompt_sd import END_CHAT_PROMPT, ROUTER_PROMPT, THINK_PROMPT
 
 logger = logging.getLogger(__name__)
+
+# Per-request token queue — set by stream_answer, read by _call_agent.
+# Using ContextVar so concurrent requests each have their own queue.
+_token_queue_var: contextvars.ContextVar[
+    asyncio.Queue | None
+] = contextvars.ContextVar("_agent_token_queue", default=None)
 
 _MAX_AGENT_TURNS = 6
 
@@ -353,7 +361,6 @@ class AgentGraph:
     async def _call_agent(self, state: AgentState) -> dict:
         agent_turns = sum(1 for m in state["messages"] if isinstance(m, AIMessage))
 
-        # Build situation assessment then inject as a hint before the main LLM call
         assessment = await self._think(state["messages"])
         messages_with_hint = list(state["messages"])
         if assessment:
@@ -361,12 +368,21 @@ class AgentGraph:
                 SystemMessage(content=f"[INTERNAL REASONING — not visible to user]\n{assessment}")
             )
 
-        response = await self._llm_with_tools.ainvoke(messages_with_hint)
-        logger.debug(
-            "_call_agent: turn=%d tool_calls=%s",
-            agent_turns,
-            [tc["name"] for tc in getattr(response, "tool_calls", [])] or "none",
-        )
+        openai_msgs = _to_openai_messages(messages_with_hint)
+        queue = _token_queue_var.get()
+
+        # Stream the final answer directly with JSON format.
+        # Tokens are pushed into the per-request queue so stream_answer can
+        # forward them to the WebSocket without a separate Phase-2 LLM call.
+        full_content = ""
+        async for chunk in self._llm_client.stream_json(openai_msgs):
+            if queue is not None:
+                await queue.put(chunk)
+            if isinstance(chunk, str):
+                full_content += chunk
+
+        response = AIMessage(content=full_content)
+        logger.debug("_call_agent: turn=%d streamed %d chars", agent_turns, len(full_content))
 
         conversation_status = await self._evaluate_end_chat(state["messages"])
         return {"messages": [response], "conversation_status": conversation_status}
@@ -507,44 +523,50 @@ class AgentGraph:
     # ------------------------------------------------------------------
 
     async def stream_answer(self, openai_messages: list[dict]) -> AsyncIterator[str | dict]:
-        """Phase 1: graph.ainvoke() collects tool results. Phase 2: stream_json for response."""
+        """Run the graph as a background task; stream tokens from _call_agent in real-time.
+
+        _call_agent now calls stream_json directly and pushes each token into a
+        per-request asyncio.Queue (via _token_queue_var ContextVar).  This coroutine
+        consumes that queue and yields tokens immediately — no second LLM call needed.
+        """
         if not self.enabled:
             raise RuntimeError("AgentGraph not built — call agent_graph.build() in container.py")
 
-        # logger.debug("stream_answer: start, messages=%d", len(openai_messages))
-
         lc_messages = _to_lc_messages(openai_messages)
-        final_state = await self._graph.ainvoke(
-            {"messages": lc_messages, "next_node": "agent", "conversation_status": 1}
-        )
-        all_messages: list[BaseMessage] = final_state["messages"]
+        token_queue: asyncio.Queue[str | dict | None] = asyncio.Queue()
+        ctx_token = _token_queue_var.set(token_queue)
 
-        # Drop the agent's last draft AIMessage (no response_format → plain text).
-        messages_for_stream = all_messages
-        if (
-            len(all_messages) > len(lc_messages)
-            and isinstance(all_messages[-1], AIMessage)
-            and not getattr(all_messages[-1], "tool_calls", None)
-        ):
-            messages_for_stream = all_messages[:-1]
+        async def _run_graph() -> dict:
+            try:
+                return await self._graph.ainvoke(
+                    {"messages": lc_messages, "next_node": "agent", "conversation_status": 1}
+                )
+            except Exception as exc:
+                logger.error("graph.ainvoke failed: %s", exc, exc_info=True)
+                raise
+            finally:
+                await token_queue.put(None)  # sentinel — signals stream_answer to stop
 
+        graph_task = asyncio.create_task(_run_graph())
+
+        try:
+            while True:
+                chunk = await token_queue.get()
+                if chunk is None:
+                    break
+                yield chunk  # str token or usage dict from stream_json
+        except Exception:
+            graph_task.cancel()
+            raise
+        finally:
+            _token_queue_var.reset(ctx_token)
+
+        final_state = await graph_task
         conv_status = final_state.get("conversation_status", 1)
-        logger.debug(
-            "stream_answer: graph done (%d→%d messages), next_node=%s, conv_status=%d, streaming",
-            len(lc_messages), len(messages_for_stream),
-            final_state.get("next_node", "?"),
-            conv_status,
-        )
-
-        ready_openai = list(_to_openai_messages(messages_for_stream))
-        async for chunk in self._llm_client.stream_json(ready_openai):
-            yield chunk
-
-        # Yield the authoritative evaluation result LAST so rag.py can override
-        # conversation_status regardless of what the LLM put in its JSON.
-        yield {"conv_status_eval": conv_status}
-
         logger.debug("stream_answer: complete, conv_status_eval=%d", conv_status)
+
+        # Authoritative evaluation result — rag.py overrides conversation_status with this.
+        yield {"conv_status_eval": conv_status}
 
 
 agent_graph = AgentGraph()
