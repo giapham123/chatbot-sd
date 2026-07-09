@@ -36,7 +36,7 @@ from typing_extensions import TypedDict
 
 from .llm import OpenAILLMClient
 from .staff_check_service import staff_check_service
-from ..prompt.en_system_prompt_sd import END_CHAT_PROMPT, ROUTER_PROMPT
+from ..prompt.en_system_prompt_sd import END_CHAT_PROMPT, ROUTER_PROMPT, THINK_PROMPT
 
 logger = logging.getLogger(__name__)
 
@@ -327,18 +327,48 @@ class AgentGraph:
     # Graph nodes
     # ------------------------------------------------------------------
 
+    async def _think(self, messages: list[AnyMessage]) -> str:
+        """Produce a brief situation assessment from conversation history."""
+        history_lines: list[str] = []
+        for m in messages:
+            if isinstance(m, HumanMessage):
+                history_lines.append(f"User: {str(m.content)[:400]}")
+            elif isinstance(m, AIMessage) and not getattr(m, "tool_calls", None):
+                history_lines.append(f"Bot: {str(m.content)[:400]}")
+            elif isinstance(m, ToolMessage):
+                history_lines.append(f"Tool({m.tool_call_id[:8]}): {str(m.content)[:200]}")
+        if not history_lines:
+            return ""
+        try:
+            assessment = await self._llm_client.complete([
+                {"role": "system", "content": THINK_PROMPT},
+                {"role": "user",   "content": "\n".join(history_lines)},
+            ])
+            logger.debug("_think assessment:\n%s", assessment)
+            return assessment.strip()
+        except Exception as exc:
+            logger.warning("_think failed: %s", exc)
+            return ""
+
     async def _call_agent(self, state: AgentState) -> dict:
-        response = await self._llm_with_tools.ainvoke(state["messages"])
         agent_turns = sum(1 for m in state["messages"] if isinstance(m, AIMessage))
+
+        # Build situation assessment then inject as a hint before the main LLM call
+        assessment = await self._think(state["messages"])
+        messages_with_hint = list(state["messages"])
+        if assessment:
+            messages_with_hint.append(
+                SystemMessage(content=f"[INTERNAL REASONING — not visible to user]\n{assessment}")
+            )
+
+        response = await self._llm_with_tools.ainvoke(messages_with_hint)
         logger.debug(
             "_call_agent: turn=%d tool_calls=%s",
             agent_turns,
             [tc["name"] for tc in getattr(response, "tool_calls", [])] or "none",
         )
 
-        # Evaluate whether the conversation should end based on accumulated history
         conversation_status = await self._evaluate_end_chat(state["messages"])
-
         return {"messages": [response], "conversation_status": conversation_status}
 
     async def _evaluate_end_chat(self, messages: list[AnyMessage]) -> int:
