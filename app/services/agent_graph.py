@@ -102,7 +102,7 @@ _TOOL_TO_NODE = {
 class AgentState(TypedDict):
     messages:            Annotated[list[AnyMessage], add_messages]
     next_node:           str   # written by decide_tool, read by _route_from_decide
-    conversation_status: int  # 1=ongoing, 5=end — written by _call_agent
+    conversation_status: int  # 1=ongoing, 4=end — written by _call_agent
 
 
 # ---------------------------------------------------------------------------
@@ -344,7 +344,7 @@ class AgentGraph:
                 {"role": "system", "content": THINK_PROMPT},
                 {"role": "user",   "content": "\n".join(history_lines)},
             ])
-            logger.debug("_think assessment:\n%s", assessment)
+            # logger.debug("_think assessment:\n%s", assessment)
             return assessment.strip()
         except Exception as exc:
             logger.warning("_think failed: %s", exc)
@@ -391,7 +391,7 @@ class AgentGraph:
         ]
         try:
             raw = (await self._llm_client.complete(eval_messages)).strip().lower()
-            result = 5 if "end" in raw else 1
+            result = 4 if "end" in raw else 1
             logger.debug("_evaluate_end_chat: %r → conversation_status=%d", raw, result)
             return result
         except Exception as exc:
@@ -511,7 +511,7 @@ class AgentGraph:
         if not self.enabled:
             raise RuntimeError("AgentGraph not built — call agent_graph.build() in container.py")
 
-        logger.debug("stream_answer: start, messages=%d", len(openai_messages))
+        # logger.debug("stream_answer: start, messages=%d", len(openai_messages))
 
         lc_messages = _to_lc_messages(openai_messages)
         final_state = await self._graph.ainvoke(
@@ -537,19 +537,14 @@ class AgentGraph:
         )
 
         ready_openai = list(_to_openai_messages(messages_for_stream))
-        if conv_status == 5:
-            ready_openai.append({
-                "role": "system",
-                "content": (
-                    "[EVALUATION] Cuộc trò chuyện đã hoàn tất. "
-                    "Đặt conversation_status=5 trong JSON output."
-                ),
-            })
-
         async for chunk in self._llm_client.stream_json(ready_openai):
             yield chunk
 
-        logger.debug("stream_answer: complete")
+        # Yield the authoritative evaluation result LAST so rag.py can override
+        # conversation_status regardless of what the LLM put in its JSON.
+        yield {"conv_status_eval": conv_status}
+
+        logger.debug("stream_answer: complete, conv_status_eval=%d", conv_status)
 
 
 agent_graph = AgentGraph()

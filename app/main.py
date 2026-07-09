@@ -42,7 +42,14 @@ async def lifespan(app: FastAPI):
     _container = await build_container(settings)
 
     if _container.ws_client:
-        await _container.ws_client.connect()
+        try:
+            await _container.ws_client.connect()
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning(
+                "WebSocket connect failed — running without WS: %s", exc
+            )
+            _container.ws_client = None
 
     kafka_task: asyncio.Task | None = None
     if _container.kafka_consumer and _container.kafka_producer:

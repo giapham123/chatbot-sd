@@ -45,6 +45,13 @@ class ConversationService:
         lf_metadata: dict | None = None,
         lf_tags: list[str] | None = None,
     ) -> AsyncIterator[StreamEvent]:
+        # If the previous session ended (status=4) and the user sends a new message,
+        # start a completely fresh session: clear history, error state, and reset status.
+        if conversation_status == 4:
+            history = []
+            error = {}
+            conversation_status = 1
+
         history = (history or [])[-self._history_turns:]
 
         # Extract error_email from the round-tripped error dict.

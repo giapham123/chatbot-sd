@@ -109,10 +109,14 @@ class DefaultRagService:
         escape_next = False
         search_buf = ""
         usage_info: dict | None = None
+        conv_status_eval: int = 1
 
         async for chunk in agent_graph.stream_answer(messages):
             if isinstance(chunk, dict):
-                usage_info = chunk
+                if "conv_status_eval" in chunk:
+                    conv_status_eval = int(chunk["conv_status_eval"])
+                else:
+                    usage_info = chunk
                 continue
 
             raw_parts.append(chunk)
@@ -152,7 +156,11 @@ class DefaultRagService:
             except Exception as exc:
                 logger.error("Langfuse generation end failed: %s", exc, exc_info=True)
 
-        yield self._parse_structured(raw)
+        result = self._parse_structured(raw)
+        # Authoritative evaluation from _evaluate_end_chat overrides LLM self-report
+        if conv_status_eval == 4:
+            result["conversation_status"] = 4
+        yield result
 
     # ------------------------------------------------------------------
     # Internal helpers
