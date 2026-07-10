@@ -157,9 +157,10 @@ class DefaultRagService:
                 logger.error("Langfuse generation end failed: %s", exc, exc_info=True)
 
         result = self._parse_structured(raw)
-        # Authoritative evaluation from _evaluate_end_chat overrides LLM self-report
-        if conv_status_eval == 4:
-            result["conversation_status"] = 4
+        # If eval says the chat ended but LLM still reported in-progress, force to 3 (ended).
+        # If LLM already set 2 (handoff) or 3 (ended), respect that value.
+        if conv_status_eval == 3 and result.get("conversation_status", 1) == 1:
+            result["conversation_status"] = 3
         yield result
 
     # ------------------------------------------------------------------

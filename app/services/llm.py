@@ -14,17 +14,38 @@ from typing import Any, AsyncIterator
 
 from openai import AsyncOpenAI
 
+# gpt-5 / o-series are reasoning models: they emit hidden reasoning tokens before
+# any visible content, which kills time-to-first-token when streaming. Sending
+# reasoning_effort="minimal" cuts that pre-answer latency dramatically.
+_REASONING_PREFIXES = ("gpt-5", "o1", "o3", "o4")
+
+
+def _is_reasoning_model(model: str) -> bool:
+    m = model.lower()
+    return any(m.startswith(p) for p in _REASONING_PREFIXES)
+
 
 class OpenAILLMClient:
-    def __init__(self, client: AsyncOpenAI, chat_model: str) -> None:
+    def __init__(
+        self,
+        client: AsyncOpenAI,
+        chat_model: str,
+        reasoning_effort: str | None = None,
+    ) -> None:
         self._client = client
         self._chat_model = chat_model
+        # Only send reasoning_effort to reasoning models; other models reject it.
+        # Default to "low" to minimise streaming latency (valid: none|low|medium|high|xhigh).
+        if _is_reasoning_model(chat_model):
+            self._extra: dict[str, Any] = {"reasoning_effort": reasoning_effort or "low"}
+        else:
+            self._extra = {}
 
     async def complete(self, messages: list[dict], **lf: Any) -> str:
         resp = await self._client.chat.completions.create(
             model=self._chat_model,
-            temperature=0,
             messages=messages,
+            **self._extra,
             **lf,
         )
         return resp.choices[0].message.content or ""
@@ -32,9 +53,9 @@ class OpenAILLMClient:
     async def complete_json(self, messages: list[dict], **lf: Any) -> str:
         resp = await self._client.chat.completions.create(
             model=self._chat_model,
-            temperature=0,
             response_format={"type": "json_object"},
             messages=messages,
+            **self._extra,
             **lf,
         )
         return resp.choices[0].message.content or ""
@@ -43,11 +64,11 @@ class OpenAILLMClient:
         """Stream chunks from a JSON-format LLM call. Yields str tokens then a usage dict."""
         stream = await self._client.chat.completions.create(
             model=self._chat_model,
-            temperature=0,
             response_format={"type": "json_object"},
             stream=True,
             stream_options={"include_usage": True},
             messages=messages,
+            **self._extra,
             **lf,
         )
         usage = None

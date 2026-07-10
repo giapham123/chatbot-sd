@@ -61,7 +61,12 @@ async def build_container(settings: Settings) -> Container:
             timeout=settings.staff_check_timeout,
         )
 
-    agent_graph.build(settings.chat_model, settings.openai_api_key)
+    agent_graph.build(
+        settings.chat_model,
+        settings.openai_api_key,
+        router_model=settings.router_model,
+        reasoning_effort=settings.chat_reasoning_effort,
+    )
 
     minio_service.init(
         endpoint=settings.minio_endpoint,

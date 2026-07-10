@@ -30,7 +30,6 @@ from langchain_core.messages import (
     AIMessage, AnyMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage,
 )
 from langchain_core.tools import tool as lc_tool
-from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
 from openai import AsyncOpenAI
@@ -110,7 +109,7 @@ _TOOL_TO_NODE = {
 class AgentState(TypedDict):
     messages:            Annotated[list[AnyMessage], add_messages]
     next_node:           str   # written by decide_tool, read by _route_from_decide
-    conversation_status: int  # 1=ongoing, 4=end — written by _call_agent
+    conversation_status: int  # 0=started,1=in-progress,2=handoff,3=ended,4=reprompt
 
 
 # ---------------------------------------------------------------------------
@@ -173,8 +172,8 @@ QdrantSearchFn = Callable[[str], Coroutine[None, None, str]]
 
 class AgentGraph:
     def __init__(self) -> None:
-        self._llm_client: OpenAILLMClient | None = None
-        self._llm_with_tools = None
+        self._llm_client: OpenAILLMClient | None = None   # chat model — answer streaming only
+        self._router_client: OpenAILLMClient | None = None  # cheap model — routing/think/eval
         self._graph = None
         self._qdrant_search: QdrantSearchFn | None = None
 
@@ -189,18 +188,17 @@ class AgentGraph:
         self,
         chat_model: str,
         api_key: str,
+        router_model: str = "",
+        reasoning_effort: str = "minimal",
         qdrant_search_fn: QdrantSearchFn | None = None,
     ) -> None:
-        self._llm_client = OpenAILLMClient(AsyncOpenAI(api_key=api_key), chat_model)
+        oai = AsyncOpenAI(api_key=api_key)
+        # Chat model streams the answer; reasoning_effort applies only if it's a
+        # gpt-5/o-series model, cutting time-to-first-token during streaming.
+        self._llm_client = OpenAILLMClient(oai, chat_model, reasoning_effort=reasoning_effort)
+        # Use cheap router model for routing/thinking/evaluation; fall back to chat model.
+        self._router_client = OpenAILLMClient(oai, router_model or chat_model)
         self._qdrant_search = qdrant_search_fn
-
-        llm = ChatOpenAI(
-            model=chat_model,
-            temperature=0,
-            openai_api_key=api_key,
-            model_kwargs={"parallel_tool_calls": False},
-        )
-        self._llm_with_tools = llm.bind_tools(TOOLS)
 
         graph = StateGraph(AgentState)
         graph.add_node("decide_tool", self._decide_tool)
@@ -280,7 +278,7 @@ class AgentGraph:
             {"role": "user",   "content": str(question)},
         ]
 
-        raw = (await self._llm_client.complete(routing_messages)).strip()
+        raw = (await self._router_client.complete(routing_messages)).strip()
 
         # Parse structured JSON response from ROUTER_PROMPT
         employee_id = ""
@@ -348,7 +346,7 @@ class AgentGraph:
         if not history_lines:
             return ""
         try:
-            assessment = await self._llm_client.complete([
+            assessment = await self._router_client.complete([
                 {"role": "system", "content": THINK_PROMPT},
                 {"role": "user",   "content": "\n".join(history_lines)},
             ])
@@ -388,17 +386,22 @@ class AgentGraph:
         return {"messages": [response], "conversation_status": conversation_status}
 
     async def _evaluate_end_chat(self, messages: list[AnyMessage]) -> int:
-        """Return 2 if the conversation should end, 1 if it should continue."""
+        """Return 3 if the conversation should end, 1 if it should continue."""
         history_lines: list[str] = []
+        bot_turns = 0
         for m in messages:
             if isinstance(m, HumanMessage):
                 history_lines.append(f"User: {str(m.content)[:300]}")
             elif isinstance(m, AIMessage) and not getattr(m, "tool_calls", None):
                 history_lines.append(f"Bot: {str(m.content)[:300]}")
+                bot_turns += 1
             elif isinstance(m, ToolMessage):
                 history_lines.append(f"Tool result: {str(m.content)[:200]}")
 
-        if not history_lines:
+        # Need at least one bot response before evaluating end-of-chat.
+        # On fresh/reset sessions state["messages"] has no bot turns yet —
+        # END_CHAT_PROMPT would incorrectly say "end" on greetings/new questions.
+        if bot_turns == 0 or not history_lines:
             return 1
 
         eval_messages = [
@@ -406,8 +409,8 @@ class AgentGraph:
             {"role": "user",   "content": "\n".join(history_lines)},
         ]
         try:
-            raw = (await self._llm_client.complete(eval_messages)).strip().lower()
-            result = 4 if "end" in raw else 1
+            raw = (await self._router_client.complete(eval_messages)).strip().lower()
+            result = 3 if "end" in raw else 1
             logger.debug("_evaluate_end_chat: %r → conversation_status=%d", raw, result)
             return result
         except Exception as exc:

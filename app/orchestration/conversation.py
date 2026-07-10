@@ -45,9 +45,8 @@ class ConversationService:
         lf_metadata: dict | None = None,
         lf_tags: list[str] | None = None,
     ) -> AsyncIterator[StreamEvent]:
-        # If the previous session ended (status=4) and the user sends a new message,
-        # start a completely fresh session: clear history, error state, and reset status.
-        if conversation_status == 4:
+        # status=2 (handoff/closed) or status=3 (natural end) → start fresh session.
+        if conversation_status in (2, 3):
             history = []
             error = {}
             conversation_status = 1

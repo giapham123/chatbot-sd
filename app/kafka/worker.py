@@ -112,10 +112,11 @@ async def channel_worker(
             # 3 — merge N messages into 1
             data, message_id, kafka_msgs = merge_batch(batch)
 
-            # 4 — inject server-side history
-            #     Queued messages carry stale chat_history (captured before the
-            #     previous reply).  Replace it so the LLM has full context.
-            if channel_id in _channel_history:
+            # 4 — inject server-side history (or clear it if session just ended)
+            incoming_status = int(data.get("conversation_status") or 0)
+            if incoming_status in (2, 3):
+                _channel_history.pop(channel_id, None)
+            elif channel_id in _channel_history:
                 data = {**data, "chat_history": _channel_history[channel_id]}
 
             # 5 — ONE LLM call for the entire batch

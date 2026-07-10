@@ -18,6 +18,7 @@ DATA_DIR = BASE_DIR / "data"
 class Settings:
     openai_api_key: str
     chat_model: str
+    chat_reasoning_effort: str  # gpt-5/o-series only: none|low|medium|high|xhigh
     router_model: str         # cheap model for query rewrite + rerank
     embed_model: str
     rag_top_k: int
@@ -62,6 +63,7 @@ class Settings:
         return Settings(
             openai_api_key=os.getenv("OPENAI_API_KEY", ""),  # set in .env — never hardcode
             chat_model=os.getenv("OPENAI_CHAT_MODEL", "gpt-4o"),
+            chat_reasoning_effort=os.getenv("OPENAI_CHAT_REASONING_EFFORT", "low"),
             router_model=os.getenv("OPENAI_ROUTER_MODEL", "gpt-4o-mini"),
             embed_model=os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small"),
             rag_top_k=int(os.getenv("RAG_TOP_K", "3")),
