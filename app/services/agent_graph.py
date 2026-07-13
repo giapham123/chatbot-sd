@@ -176,6 +176,8 @@ class AgentGraph:
         self._router_client: OpenAILLMClient | None = None  # cheap model — routing/think/eval
         self._graph = None
         self._qdrant_search: QdrantSearchFn | None = None
+        self._think_enabled: bool = False     # extra assessment call before answer
+        self._eval_end_enabled: bool = False  # extra end-of-chat check after answer
 
     @property
     def enabled(self) -> bool:
@@ -191,6 +193,8 @@ class AgentGraph:
         router_model: str = "",
         reasoning_effort: str = "minimal",
         qdrant_search_fn: QdrantSearchFn | None = None,
+        think_enabled: bool = False,
+        eval_end_enabled: bool = False,
     ) -> None:
         oai = AsyncOpenAI(api_key=api_key)
         # Chat model streams the answer; reasoning_effort applies only if it's a
@@ -199,6 +203,8 @@ class AgentGraph:
         # Use cheap router model for routing/thinking/evaluation; fall back to chat model.
         self._router_client = OpenAILLMClient(oai, router_model or chat_model)
         self._qdrant_search = qdrant_search_fn
+        self._think_enabled = think_enabled
+        self._eval_end_enabled = eval_end_enabled
 
         graph = StateGraph(AgentState)
         graph.add_node("decide_tool", self._decide_tool)
@@ -359,12 +365,15 @@ class AgentGraph:
     async def _call_agent(self, state: AgentState) -> dict:
         agent_turns = sum(1 for m in state["messages"] if isinstance(m, AIMessage))
 
-        assessment = await self._think(state["messages"])
         messages_with_hint = list(state["messages"])
-        if assessment:
-            messages_with_hint.append(
-                SystemMessage(content=f"[INTERNAL REASONING — not visible to user]\n{assessment}")
-            )
+        # Optional pre-answer "situation assessment" — an extra LLM round-trip
+        # right before streaming. Off by default (adds latency to first token).
+        if self._think_enabled:
+            assessment = await self._think(state["messages"])
+            if assessment:
+                messages_with_hint.append(
+                    SystemMessage(content=f"[INTERNAL REASONING — not visible to user]\n{assessment}")
+                )
 
         openai_msgs = _to_openai_messages(messages_with_hint)
         queue = _token_queue_var.get()
@@ -382,7 +391,12 @@ class AgentGraph:
         response = AIMessage(content=full_content)
         logger.debug("_call_agent: turn=%d streamed %d chars", agent_turns, len(full_content))
 
-        conversation_status = await self._evaluate_end_chat(state["messages"])
+        # Optional authoritative end-of-chat check — an extra LLM round-trip after
+        # streaming. Off by default: the main LLM already returns conversation_status
+        # in its JSON (parsed in rag.py), so 1 = "let the main LLM decide".
+        conversation_status = 1
+        if self._eval_end_enabled:
+            conversation_status = await self._evaluate_end_chat(state["messages"])
         return {"messages": [response], "conversation_status": conversation_status}
 
     async def _evaluate_end_chat(self, messages: list[AnyMessage]) -> int:

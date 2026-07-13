@@ -24,6 +24,11 @@ class Settings:
     rag_top_k: int
     rag_min_score: float
     rerank_candidates: int    # how many Qdrant hits to fetch before reranking
+    # Latency toggles — each of these is an extra LLM round-trip per turn.
+    # Off by default for speed; turn on if answer quality needs it.
+    rag_rerank_enabled: bool      # LLM reorders KB hits (else use vector score order)
+    agent_think_enabled: bool     # extra "situation assessment" call before the answer
+    agent_eval_end_enabled: bool  # extra end-of-chat check (else trust main LLM's conv_status)
     qdrant_url: str           # Qdrant server URL (RAG vector store)
     qdrant_api_key: Optional[str]  # required for Qdrant Cloud
     qdrant_collection: str    # collection populated by scripts/embed_to_qdrant.py
@@ -69,6 +74,9 @@ class Settings:
             rag_top_k=int(os.getenv("RAG_TOP_K", "3")),
             rag_min_score=float(os.getenv("RAG_MIN_SCORE", "0.30")),
             rerank_candidates=int(os.getenv("RERANK_CANDIDATES", "8")),
+            rag_rerank_enabled=os.getenv("RAG_RERANK_ENABLED", "false").lower() == "true",
+            agent_think_enabled=os.getenv("AGENT_THINK_ENABLED", "false").lower() == "true",
+            agent_eval_end_enabled=os.getenv("AGENT_EVAL_END_ENABLED", "false").lower() == "true",
             qdrant_url=os.getenv("QDRANT_URL", "http://localhost:6333"),
             qdrant_api_key=os.getenv("QDRANT_API_KEY") or None,
             qdrant_collection=os.getenv("QDRANT_COLLECTION", "chatbot_sd_kb"),

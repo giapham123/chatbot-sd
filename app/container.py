@@ -66,6 +66,8 @@ async def build_container(settings: Settings) -> Container:
         settings.openai_api_key,
         router_model=settings.router_model,
         reasoning_effort=settings.chat_reasoning_effort,
+        think_enabled=settings.agent_think_enabled,
+        eval_end_enabled=settings.agent_eval_end_enabled,
     )
 
     minio_service.init(
@@ -98,6 +100,7 @@ async def build_container(settings: Settings) -> Container:
         fallback_message=data.responses.text("handoff_sd"),
         rerank_candidates=settings.rerank_candidates,
         chat_model=settings.chat_model,
+        rerank_enabled=settings.rag_rerank_enabled,
     )
 
     agent_graph.set_qdrant_search(rag.search_kb)

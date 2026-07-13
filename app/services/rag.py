@@ -22,6 +22,28 @@ from .langfuse_service import langfuse_service
 logger = logging.getLogger(__name__)
 
 
+def _merge_consecutive_turns(history: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Collapse consecutive same-role turns into one.
+
+    When a user sends several messages in a row before the bot replies, the
+    history looks like:
+        (user, a) (bot, x) (user, b) (user, c) (user, d)
+    We merge the trailing user run into a single turn so the LLM sees one
+    coherent question per turn instead of fragmented messages:
+        (user, a) (bot, x) (user, "b\\nc\\nd")
+    """
+    merged: list[tuple[str, str]] = []
+    for role, text in history:
+        text = "" if text is None else str(text)
+        if merged and merged[-1][0] == role:
+            prev_role, prev_text = merged[-1]
+            joined = f"{prev_text}\n{text}".strip() if prev_text else text
+            merged[-1] = (prev_role, joined)
+        else:
+            merged.append((role, text))
+    return merged
+
+
 def _extract_until_quote(text: str, escape_next: bool) -> tuple[str, bool, bool]:
     """Extract chars from a streaming JSON string value until the closing unescaped quote.
 
@@ -55,6 +77,7 @@ class DefaultRagService:
         fallback_message: str,
         rerank_candidates: int = 8,
         chat_model: str = "",
+        rerank_enabled: bool = False,
     ) -> None:
         self._embedder = embedder
         self._store = vector_store
@@ -65,6 +88,7 @@ class DefaultRagService:
         self._fallback_message = fallback_message
         self._rerank_candidates = max(rerank_candidates, top_k)
         self._chat_model = chat_model
+        self._rerank_enabled = rerank_enabled
 
     async def answer_stream(
         self,
@@ -176,6 +200,10 @@ class DefaultRagService:
         image_b64: list[tuple[str, str]] | None = None,
     ) -> list[dict]:
         """Assemble the LLM message list — KB search is handled by the LangGraph qdrant node."""
+        # Merge consecutive same-role turns (e.g. several user messages in a row
+        # before the bot replied) so the LLM sees one coherent turn per side.
+        history = _merge_consecutive_turns(history)
+
         # Rewrite follow-up questions into standalone queries for the qdrant node
         standalone = await self._contextualize(query, history)
 
@@ -251,11 +279,14 @@ class DefaultRagService:
         }
 
     async def search_kb(self, query: str) -> str:
-        """Embed → vector search → rerank → formatted text. Called by the LangGraph qdrant node."""
+        """Embed → vector search → (rerank) → formatted text. Called by the LangGraph qdrant node."""
+        # When rerank is disabled, only fetch top_k (vector score order is used
+        # as-is) — no need to over-fetch candidates for an LLM reorder that won't run.
+        fetch_n = self._rerank_candidates if self._rerank_enabled else self._top_k
         vectors = await self._embedder.embed([query])
         if not vectors:
             return "(không có kết quả)"
-        hits = await self._store.search(vectors[0], self._rerank_candidates)
+        hits = await self._store.search(vectors[0], fetch_n)
         candidates = [
             self._docs[doc_id]
             for doc_id, score in hits
@@ -263,7 +294,8 @@ class DefaultRagService:
         ]
         if not candidates:
             return "(không có kết quả phù hợp trong KB)"
-        ranked = await self._rerank(query, candidates)
+        # Skip the LLM rerank round-trip unless explicitly enabled.
+        ranked = await self._rerank(query, candidates) if self._rerank_enabled else candidates
         return "\n\n".join(d.as_text() for d in ranked[: self._top_k])
 
     async def _contextualize(self, query: str, history: list[tuple[str, str]]) -> str:

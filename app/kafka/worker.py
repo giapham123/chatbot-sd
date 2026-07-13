@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -56,6 +57,14 @@ OUTPUT_URI = "/api/v1/bot/chat/reply"
 # Any message that arrives within this window goes into the same queue.
 CHANNEL_IDLE_TIMEOUT: float = 30.0
 
+# Debounce window (ms): after the first message of a turn, wait this long so a
+# burst of rapid messages typed for the same channel is gathered and merged into
+# ONE turn (one LLM call, one reply) instead of N separate turns. 0 disables it.
+# The window resets on each new message (idle-based), capped by DEBOUNCE_MAX_S so
+# a user who keeps typing can never delay the reply indefinitely.
+CHANNEL_DEBOUNCE_MS: float = float(os.getenv("CHANNEL_DEBOUNCE_MS", "1200"))
+CHANNEL_DEBOUNCE_MAX_S: float = float(os.getenv("CHANNEL_DEBOUNCE_MAX_S", "5"))
+
 
 # ---------------------------------------------------------------------------
 # Per-channel state
@@ -69,6 +78,7 @@ class ChannelState:
 
 _channels:        dict[str, ChannelState] = {}
 _channel_history: dict[str, list[dict]]  = {}
+_channel_ended:   set[str]                = set()  # channels whose last turn ended the session
 worker_tasks:     set[asyncio.Task]       = set()
 
 
@@ -95,6 +105,26 @@ async def channel_worker(
             except asyncio.TimeoutError:
                 break   # 30 s of silence → exit worker
 
+            # 1b — debounce: gather a rapid burst into ONE turn. After the first
+            #      message, keep pulling more as long as they keep arriving within
+            #      CHANNEL_DEBOUNCE_MS of each other (idle-reset), capped at
+            #      CHANNEL_DEBOUNCE_MAX_S so a user who keeps typing can't delay
+            #      the reply forever. This is what merges "human ask / human ask /
+            #      human ask" (rapid consecutive messages) into a single LLM call.
+            gathered: list[QueueItem] = []
+            if CHANNEL_DEBOUNCE_MS > 0:
+                loop = asyncio.get_running_loop()
+                window = CHANNEL_DEBOUNCE_MS / 1000.0
+                deadline = loop.time() + CHANNEL_DEBOUNCE_MAX_S
+                while True:
+                    remaining = min(window, deadline - loop.time())
+                    if remaining <= 0:
+                        break
+                    try:
+                        gathered.append(await asyncio.wait_for(state.queue.get(), timeout=remaining))
+                    except asyncio.TimeoutError:
+                        break   # quiet gap → burst is complete
+
             # 2 — drain ALL messages already in the queue right now (non-blocking)
             #
             #     Why this works for simultaneous messages:
@@ -107,15 +137,23 @@ async def channel_worker(
             #     While the LLM call below is running, consume_loop dispatches
             #     new messages into this queue.  On the next loop iteration this
             #     drain picks them all up at once.
-            batch: list[QueueItem] = [first, *drain(state.queue)]
+            batch: list[QueueItem] = [first, *gathered, *drain(state.queue)]
 
             # 3 — merge N messages into 1
             data, message_id, kafka_msgs = merge_batch(batch)
 
-            # 4 — inject server-side history (or clear it if session just ended)
+            # 4 — inject server-side history (or start fresh if the session ended)
+            #
+            #     A session is "ended" when the client signals conv=2/3 OR when the
+            #     PREVIOUS turn ended it (tracked in _channel_ended). In either case
+            #     the next message must start a clean session — even if the client
+            #     still sends conv=1 — otherwise the stale ended history makes the
+            #     bot think the chat is over and it replies with nothing.
             incoming_status = int(data.get("conversation_status") or 0)
-            if incoming_status in (2, 3):
+            if incoming_status in (2, 3) or channel_id in _channel_ended:
                 _channel_history.pop(channel_id, None)
+                _channel_ended.discard(channel_id)
+                data = {**data, "chat_history": [], "conversation_status": 1, "error": {}}
             elif channel_id in _channel_history:
                 data = {**data, "chat_history": _channel_history[channel_id]}
 
@@ -124,9 +162,17 @@ async def channel_worker(
                 output = await handle_chat_sd(data, conversation, message_id, ws_client)
                 await producer.send(output_topic, {"uri": OUTPUT_URI, "data": output})
 
-                # 6 — store history so the next batch gets A's answer in context
-                if output.get("chat_history"):
+                # 6 — store history so the next batch gets A's answer in context.
+                #     But if THIS turn ended the session (output conv=2 handoff /
+                #     3 ended), drop the history and mark the channel ended so the
+                #     next message starts fresh regardless of the client's status.
+                out_status = int(output.get("conversation_status") or 0)
+                if out_status in (2, 3):
+                    _channel_history.pop(channel_id, None)
+                    _channel_ended.add(channel_id)
+                elif output.get("chat_history"):
                     _channel_history[channel_id] = output["chat_history"]
+                    _channel_ended.discard(channel_id)
 
             except Exception as exc:
                 logger.error("Worker error channel=%s: %s", channel_id, exc, exc_info=True)

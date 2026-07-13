@@ -31,16 +31,13 @@ async def handle_chat_sd(
     history             = lc_to_tuples(data.get("chat_history"))
     conversation_status = int(data.get("conversation_status") or 0)
     error               = data.get("error") if isinstance(data.get("error"), dict) else {}
-    image_url       = data.get("image_url") or []
-    image_detection = minio_service.get_image_urls(image_url, platform)
-    image_b64: list[tuple[str, str]] = []
-    for _key in image_url:
-        _result = await minio_service.aget_image_b64(_key)
-        if _result:
-            image_b64.append(_result)
 
+    # Emit "start" FIRST — before any work that can fail (e.g. MinIO image
+    # fetch). Otherwise a failure here would bubble to the worker's except,
+    # which logs but sends nothing → the FE receives absolutely nothing.
     if ws_client:
         await ws_client.send(agent_id, channel_id, message_id, "start", "")
+        logger.info("chat_sd: WS 'start' sent channel=%s msg=%s", channel_id, message_id)
 
     lf_metadata = {
         "message_id": message_id,
@@ -51,8 +48,17 @@ async def handle_chat_sd(
         "conversation_status": conversation_status,
     }
 
+    image_detection: list | None = None
     output: dict | None = None
     try:
+        image_url       = data.get("image_url") or []
+        image_detection = minio_service.get_image_urls(image_url, platform)
+        image_b64: list[tuple[str, str]] = []
+        for _key in image_url:
+            _result = await minio_service.aget_image_b64(_key)
+            if _result:
+                image_b64.append(_result)
+
         async for event in conversation.stream(
             channel_id, question, history,
             agent_id=agent_id,
