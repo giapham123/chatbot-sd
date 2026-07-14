@@ -566,17 +566,29 @@ class AgentGraph:
 
         graph_task = asyncio.create_task(_run_graph())
 
+        completed = False
         try:
             while True:
                 chunk = await token_queue.get()
                 if chunk is None:
+                    completed = True
                     break
                 yield chunk  # str token or usage dict from stream_json
-        except Exception:
+        except BaseException:
+            # Includes CancelledError (supersede): stop the background graph so the
+            # LLM call doesn't keep running after we've abandoned this turn.
             graph_task.cancel()
             raise
         finally:
             _token_queue_var.reset(ctx_token)
+            # Safety net: if we're unwinding before the graph finished, make sure
+            # the background task is cancelled and awaited (no orphaned LLM stream).
+            if not completed and not graph_task.done():
+                graph_task.cancel()
+                try:
+                    await graph_task
+                except BaseException:
+                    pass
 
         final_state = await graph_task
         conv_status = final_state.get("conversation_status", 1)
